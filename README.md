@@ -122,6 +122,4 @@ A: 在设置页 → 通用设置 → 点击"修改快捷键"，或在 Chrome 地
 
 ## 📄 License
 
-MIT
-
-MIT
+GNU GPLv3

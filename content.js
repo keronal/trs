@@ -558,10 +558,27 @@
       }
     });
 
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
+    // document.body 可能尚未就绪（如 XML 页面、某些 iframe 等边缘场景）
+    if (document.body) {
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+    } else {
+      // body 尚不可用，等待 DOM 就绪后重试
+      const tryObserve = () => {
+        if (document.body) {
+          observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+          });
+        }
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', tryObserve, { once: true });
+      }
+      // readyState 为 'interactive' 或 'complete' 但仍无 body 的情况（极罕见），不再重试
+    }
   }
 
   let debounceTimer = null;

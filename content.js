@@ -27,6 +27,20 @@
     '.trs-translation', '.trs-original',
   ].join(',');
 
+  // x.com / Twitter 上不应翻译的元素
+  // 用户名、时间戳、社交上下文、分析数据等都是 UI 标注，不是自然语言内容
+  const XCOM_SKIP_SELECTORS = [
+    '[data-testid="User-Name"]',
+    '[data-testid="socialContext"]',
+    '[data-testid="app-text-transition-container"]',
+    'time',
+    '[role="link"]',
+    '[aria-hidden="true"]',
+  ].join(',');
+
+  // 是否为 x.com / twitter.com
+  const isXDomain = /(^|\.)(x\.com|twitter\.com)$/i.test(window.location.hostname);
+
   // 应翻译的块级元素
   const BLOCK_SELECTORS = [
     'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -278,6 +292,11 @@
 
     const elements = document.body.querySelectorAll(BLOCK_SELECTORS);
 
+    // x.com 上收集所有 tweetText 容器，用于跳过其子元素
+    const tweetTextContainers = isXDomain
+      ? new Set(document.querySelectorAll('[data-testid="tweetText"]'))
+      : null;
+
     for (const el of elements) {
       if (blocks.length >= MAX_BLOCKS) break;
 
@@ -285,6 +304,19 @@
       if (el.closest(SKIP_SELECTORS)) continue;
       if (el.matches(SKIP_SELECTORS)) continue;
       if (translatedElements.has(el)) continue;
+
+      // x.com 特殊处理：跳过 UI 标注元素（用户名、时间戳、社交上下文等）
+      if (isXDomain) {
+        if (el.matches(XCOM_SKIP_SELECTORS)) continue;
+        if (el.closest(XCOM_SKIP_SELECTORS)) continue;
+
+        // 如果当前元素在 tweetText 容器内部但不是容器本身，跳过
+        // 因为我们会在 tweetText 容器级别统一翻译完整推文
+        if (tweetTextContainers && !tweetTextContainers.has(el)) {
+          const parentTweet = el.closest('[data-testid="tweetText"]');
+          if (parentTweet) continue;
+        }
+      }
 
       // 获取直接文本内容（不包括子元素中已被处理的内容）
       const text = getDirectText(el);
@@ -385,6 +417,9 @@
 
     // 版本号（如 v1.0.0、1.2.3）
     if (/^v?\d+\.\d+(?:\.\d+)*$/.test(text)) return true;
+
+    // Hashtag（如 #AI、#MachineLearning、#hello_world），这些是标签不是自然语言
+    if (/^#[\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]+$/.test(text)) return true;
 
     // 纯英文+数字+符号，无空格，不含中/日/韩/阿等文字
     if (/^[a-zA-Z\d.\-/_@#$%^&*()[\]{}<>|~`!+=:;,"'?]+$/.test(text) && text.length < 3) return true;

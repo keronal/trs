@@ -223,23 +223,38 @@
 
     try {
       // 收集需要翻译的文本块（可视区域优先）
-      const textBlocks = collectTranslatableTexts();
+      let textBlocks = collectTranslatableTexts();
 
       if (textBlocks.length === 0) {
-        isTranslating = false;
         return;
       }
 
-      // 分批翻译：所有批次并行发送，由 background 的并发队列调度
-      const BATCH_SIZE = 20;
-      const batchPromises = [];
+      // 分批翻译：小块批次让每个 API 请求更快返回，避免超时被整批重试
+      // 分波次发送，每波之间重新收集滚动加载的新内容，新推文能及时得到翻译
+      const BATCH_SIZE = 8;
+      const WAVE_SIZE = BATCH_SIZE * 6; // 每波约 6 个并发批次（与 background 默认并发一致）
+      let offset = 0;
 
-      for (let i = 0; i < textBlocks.length; i += BATCH_SIZE) {
-        const batch = textBlocks.slice(i, i + BATCH_SIZE);
-        batchPromises.push(translateBatch(batch));
+      while (offset < textBlocks.length && isActive) {
+        const waveBlocks = textBlocks.slice(offset, offset + WAVE_SIZE);
+        offset += waveBlocks.length;
+
+        const batchPromises = [];
+        for (let i = 0; i < waveBlocks.length; i += BATCH_SIZE) {
+          const batch = waveBlocks.slice(i, i + BATCH_SIZE);
+          batchPromises.push(translateBatch(batch));
+        }
+
+        await Promise.allSettled(batchPromises);
+
+        // 波次之间重新收集（X 滚动会懒加载新推文），插入到剩余队列尾部
+        if (isActive && offset < textBlocks.length) {
+          const freshBlocks = collectTranslatableTexts();
+          if (freshBlocks.length > 0) {
+            textBlocks = textBlocks.concat(freshBlocks);
+          }
+        }
       }
-
-      await Promise.allSettled(batchPromises);
     } finally {
       isTranslating = false;
     }
@@ -366,6 +381,8 @@
       } else if (node.nodeType === Node.ELEMENT_NODE) {
         // 跳过译文元素
         if (node.classList && node.classList.contains('trs-translation')) continue;
+        // 空子元素直接跳过：没有任何文本就不贡献内容，避免触发昂贵的样式计算
+        if (!node.textContent || !node.textContent.trim()) continue;
         // 如果是内联元素且不包含子块级元素，则收集其文本
         if (isInlineElement(node) && !containsBlockElement(node)) {
           text += node.textContent || '';
@@ -378,20 +395,31 @@
     return text.replace(/\s+/g, ' ').trim();
   }
 
+  // 缓存样式/结构判断结果（WeakMap 不阻止 GC）
+  // X 等 SPA 滚动时会反复重扫 DOM，避免每次触发昂贵的 getComputedStyle
+  const inlineCache = new WeakMap();
+  const blockCache = new WeakMap();
+
   function isInlineElement(el) {
+    if (inlineCache.has(el)) return inlineCache.get(el);
     const inlineDisplay = ['inline', 'inline-block', 'inline-flex', 'inline-table'];
     const style = window.getComputedStyle(el);
-    return inlineDisplay.includes(style.display);
+    const result = inlineDisplay.includes(style.display);
+    inlineCache.set(el, result);
+    return result;
   }
 
   function containsBlockElement(el) {
+    if (blockCache.has(el)) return blockCache.get(el);
     const blockTags = ['P', 'DIV', 'SECTION', 'ARTICLE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
       'UL', 'OL', 'LI', 'TABLE', 'BLOCKQUOTE', 'PRE', 'HR'];
+    let found = false;
     for (const child of el.children) {
-      if (blockTags.includes(child.tagName)) return true;
-      if (containsBlockElement(child)) return true;
+      if (blockTags.includes(child.tagName)) { found = true; break; }
+      if (containsBlockElement(child)) { found = true; break; }
     }
-    return false;
+    blockCache.set(el, found);
+    return found;
   }
 
   /**

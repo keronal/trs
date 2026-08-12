@@ -6,7 +6,9 @@
 const DEEPSEEK_API_BASE = 'https://api.deepseek.com/v1';
 const DEFAULT_MAX_CONCURRENT = 6;
 const MAX_RETRIES = 2;
-const REQUEST_TIMEOUT = 30000;
+// 超时从 30s 提到 60s：批次已缩小后正常请求很少超过 60s，
+// 但过短的超时会让稍慢的请求被误杀并整批重试，反而更慢
+const REQUEST_TIMEOUT = 60000;
 
 // 翻译缓存：key = `${lang}:${text}`, value = translated text
 const translationCache = new Map();
@@ -123,7 +125,7 @@ async function callDeepSeekAPI(texts, targetLang, apiKey, model) {
           { role: 'user', content: userContent },
         ],
         temperature: 0.1,
-        max_tokens: 8192,
+        max_tokens: 4096,
       }),
       signal: controller.signal,
     });

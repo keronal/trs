@@ -411,16 +411,50 @@
 
         entry.done = true;
         entry.translation = translation;
-        for (const el of entry.elements) {
-          if (el.isConnected) {
-            injectTranslation(el, translation);
-            translatedElements.add(el);
-          }
-        }
+        injectEntryTranslation(entry);
       });
     } catch (err) {
       console.error('[TRS] 翻译请求失败:', err.message);
       requeueFailed(entries);
+    }
+  }
+
+  /**
+   * 为登记条目注入译文。
+   * 关键规则：同文嵌套元素（如 <div>原文</div> 内含 <span>原文</span>）只注入最外层，
+   * 并移除内层已存在的重复译文——否则同一句话会显示两三遍。
+   * 互不嵌套的同文元素（如页面里多个 "Read more" 按钮）各自注入一次。
+   */
+  function injectEntryTranslation(entry) {
+    const translation = entry.translation;
+    const connected = [...entry.elements].filter(el => el.isConnected);
+
+    // 先找被同文祖先覆盖的元素
+    const coveredByAncestor = new Set();
+    for (const el of connected) {
+      for (const other of connected) {
+        if (other !== el && other.contains(el)) {
+          coveredByAncestor.add(el);
+          break;
+        }
+      }
+    }
+
+    // 清除被覆盖层残留的译文
+    for (const el of coveredByAncestor) {
+      const existing = el.querySelector(':scope > .trs-translation');
+      if (existing) existing.remove();
+    }
+
+    // 只注入最外层元素
+    for (const el of connected) {
+      if (!translation) break;
+      if (coveredByAncestor.has(el)) {
+        translatedElements.add(el); // 已被祖先译文覆盖，标记即可
+        continue;
+      }
+      injectTranslation(el, translation);
+      translatedElements.add(el);
     }
   }
 
@@ -454,6 +488,7 @@
    */
   function collectFromRoot(root, maxBlocks) {
     const candidates = [];
+    const touchedDone = new Set();
 
     const elements = root.querySelectorAll(BLOCK_SELECTORS);
 
@@ -496,6 +531,10 @@
       // 跳过代码标识符风格文本（camelCase、snake_case、路径、用户名/仓库名等）
       if (isCodeLikeIdentifier(text)) continue;
 
+      // x.com：跳过 X 自带翻译功能的提示条（"Translated from …"、"从…翻译而来"、"显示原文" 等），
+      // 这些是 UI 标注，不是推文内容，翻译后只会造成重复显示
+      if (isXDomain && isXTranslateNotice(text)) continue;
+
       // 检查是否主要为非文本内容
       const textRatio = text.replace(/[\s\d.,;:!?\-–—()（）《》【】\[\]"'`·•・…]/g, '').length / text.length;
       if (textRatio < 0.3) continue;
@@ -523,15 +562,21 @@
       if (entry.done) {
         // 已有译文：新出现的同文元素直接注入，无需 API
         if (entry.translation) {
-          injectTranslation(el, entry.translation);
+          touchedDone.add(entry); // 延迟到扫描结束后统一注入（嵌套去重需要全集）
+        } else {
+          translatedElements.add(el); // 原文=译文，无需注入
         }
-        translatedElements.add(el);
         continue;
       }
 
       if (!entry.queued && !entry.inFlight && !candidates.includes(entry)) {
         candidates.push(entry);
       }
+    }
+
+    // 处理本次扫描中新出现的、已有译文的同文元素
+    for (const entry of touchedDone) {
+      injectEntryTranslation(entry);
     }
 
     // 可视区域优先排序（入队顺序决定初始次序，出队时还会按实时距离重排）
@@ -623,6 +668,22 @@
       }
       if (!anyConnected) registry.delete(key);
     }
+  }
+
+  /**
+   * 检测文本是否为 X 自带翻译功能的提示条 UI 标注
+   */
+  function isXTranslateNotice(text) {
+    // "Translated from Chinese" / "Translated from 简体中文" 等
+    if (/^translated from\b/i.test(text)) return true;
+
+    // "从中文翻译而来" / "翻译自日语" 等短句
+    if (text.length < 40 && /^(从|由).{0,15}(翻译|译自)/.test(text)) return true;
+
+    // "显示原文" / "查看原文" / "Show original" 等按钮文案
+    if (/^(显示原文|查看原文|show original|view original)$/i.test(text)) return true;
+
+    return false;
   }
 
   /**

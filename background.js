@@ -4,15 +4,15 @@
 // ============================================================
 
 const DEEPSEEK_API_BASE = 'https://api.deepseek.com/v1';
-const DEFAULT_MAX_CONCURRENT = 6;
+const DEFAULT_MAX_CONCURRENT = 8;
 const MAX_RETRIES = 2;
-// 超时从 30s 提到 60s：批次已缩小后正常请求很少超过 60s，
-// 但过短的超时会让稍慢的请求被误杀并整批重试，反而更慢
-const REQUEST_TIMEOUT = 60000;
+// 内容侧已改为连续优先级调度，挂起请求只占用一个并发槽（不会阻塞整条管线），
+// 45s 足够覆盖正常慢请求，同时避免挂死槽位过久
+const REQUEST_TIMEOUT = 45000;
 
 // 翻译缓存：key = `${lang}:${text}`, value = translated text
 const translationCache = new Map();
-const CACHE_MAX_SIZE = 2000;
+const CACHE_MAX_SIZE = 4000;
 const CACHE_STORAGE_KEY = 'translationCache';
 let cacheDirty = false;
 let cacheSaveTimer = null;
@@ -247,13 +247,18 @@ async function processQueue() {
     activeRequests++;
     processTask(task).finally(() => {
       activeRequests--;
+      // 队列与在途全部清空时立即持久化缓存（service worker 随时可能被回收，
+      // 30s 防抖会丢失最近写入的尾巴）
+      if (activeRequests === 0 && pendingQueue.length === 0) {
+        persistCache();
+      }
       processQueue();
     });
   }
 }
 
 async function processTask(task) {
-  const { texts, targetLang, apiKey, model, resolve, reject, tabId } = task;
+  const { texts, indexMap, resultLength, targetLang, apiKey, model, resolve, reject, tabId } = task;
 
   // 检查标签页是否仍然存在，避免为已关闭的页面浪费 API 调用
   if (tabId != null) {
@@ -261,7 +266,7 @@ async function processTask(task) {
       await chrome.tabs.get(tabId);
     } catch (e) {
       // 标签页已关闭，跳过翻译
-      resolve(texts.map(() => ''));
+      resolve(new Array(resultLength).fill(''));
       return;
     }
   }
@@ -270,16 +275,16 @@ async function processTask(task) {
     // 检查缓存
     const uncachedTexts = [];
     const uncachedIndices = [];
-    const results = new Array(texts.length).fill('');
+    const results = new Array(resultLength).fill('');
 
     texts.forEach((text, i) => {
       const cacheKey = getCacheKey(text, targetLang);
       const cached = translationCache.get(cacheKey);
       if (cached !== undefined) {
-        results[i] = cached;
+        results[indexMap[i]] = cached;
       } else {
         uncachedTexts.push(text);
-        uncachedIndices.push(i);
+        uncachedIndices.push(indexMap[i]);
       }
     });
 
@@ -295,6 +300,7 @@ async function processTask(task) {
       });
     }
 
+    // 队列清空时立即持久化缓存（service worker 随时可能被回收，30s 防抖会丢失尾巴）
     resolve(results);
   } catch (err) {
     reject(err);
@@ -341,19 +347,26 @@ async function handleTranslateTexts(message, sender) {
     return { error: '请先在设置中配置 DeepSeek API Key' };
   }
 
-  // 过滤空文本和过长文本
-  const validTexts = texts.map(t => {
+  // 过滤空文本和过长文本（空文本不发送，减少 token 与响应延迟）
+  const items = [];
+  texts.forEach((t, i) => {
     const trimmed = (t || '').trim();
-    return trimmed.length > 2000 ? trimmed.substring(0, 2000) : trimmed;
+    if (!trimmed) return;
+    items.push({
+      text: trimmed.length > 2000 ? trimmed.substring(0, 2000) : trimmed,
+      index: i,
+    });
   });
 
-  if (validTexts.every(t => !t)) {
-    return { translations: validTexts.map(() => '') };
+  if (items.length === 0) {
+    return { translations: texts.map(() => '') };
   }
 
   return new Promise((resolve, reject) => {
     pendingQueue.push({
-      texts: validTexts,
+      texts: items.map(x => x.text),
+      indexMap: items.map(x => x.index),
+      resultLength: texts.length,
       targetLang: targetLang || 'zh-CN',
       apiKey,
       model: model || 'deepseek-v4-flash',
@@ -376,7 +389,7 @@ const DEFAULT_SETTINGS = {
   translationStyle: 'below',
   fontSize: '0.92em',
   autoTranslate: false,
-  maxConcurrent: 6,
+  maxConcurrent: 8,
   excludedDomains: [],
 };
 

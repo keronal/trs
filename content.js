@@ -1,6 +1,13 @@
 // ============================================================
 // TRS Content Script
 // 页面文本提取、译文注入、动态内容监听
+//
+// 调度模型（v2）：连续优先级队列
+// - 所有待译文本登记到 registry（按文本去重，同文多元素共享一次 API 调用）
+// - 队列按「距视口距离」动态排序，出队时取最近的一批
+// - 无波次屏障：一批返回立即补下一批，慢请求只占一个并发槽
+// - MutationObserver 不再被翻译状态门控，新内容随时入队
+// - 滚动触发补充收集，覆盖 300 块上限之外的静态长页面
 // ============================================================
 
 (function () {
@@ -10,13 +17,23 @@
   // 状态管理
   // ============================================================
 
-  let isTranslating = false;
   let isActive = false;
+  let runId = 0;               // 每次 start/stop 递增，使在途结果失效
   let settings = {};
   let observer = null;
   let translatedElements = new WeakSet();
-  const seenTexts = new Set(); // 跨批次文本去重，防止同一文本在不同元素中重复翻译
-  const SEEN_TEXTS_MAX = 1500;  // 限制大小防止内存泄漏
+
+  // 文本登记表：normalizedText -> entry
+  // entry = { key, text, elements:Set<Element>, retries, done, translation, queued, inFlight, distance }
+  const registry = new Map();
+  const queue = [];            // 待翻译 entry 引用数组（唯一文本）
+  let inFlight = 0;
+
+  const BATCH_SIZE = 8;
+  const MAX_BLOCKS_PER_SCAN = 300;   // 单次全页扫描收集上限
+  const QUEUE_MAX = 600;             // 队列长度上限，防止无限滚动页内存膨胀
+  const REGISTRY_MAX = 4000;         // 登记表上限，超出时清理已脱离 DOM 的条目
+  const RETRY_LIMIT = 1;             // 内容侧失败重排次数（background 另有重试）
 
   // 不应翻译的元素选择器
   const SKIP_SELECTORS = [
@@ -25,6 +42,9 @@
     'svg', 'canvas', 'video', 'audio', 'img',
     '[translate="no"]', '[data-trs-ignore]',
     '.trs-translation', '.trs-original',
+    // 导航/页脚等站点 UI 框架：不是正文，翻译它们浪费 API 槽位
+    'nav', 'footer',
+    '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
   ].join(',');
 
   // x.com / Twitter 上不应翻译的元素
@@ -83,6 +103,9 @@
     // 设置 DOM 监听
     setupMutationObserver();
 
+    // 滚动监听：静态长页面滚入未翻译区域时补充收集
+    setupScrollListener();
+
     // 注入动态样式元素
     injectDynamicStyle();
   }
@@ -132,17 +155,16 @@
         break;
 
       case 'GET_STATUS':
-        sendResponse({ isActive, isTranslating });
+        sendResponse({ isActive, isTranslating: getIsTranslating() });
         break;
 
       case 'REMOVE_ALL_TRANSLATIONS':
-        removeAllTranslations();
+        stopTranslation();
         sendResponse({ success: true });
         break;
 
       case 'RETRANSLATE_PAGE':
-        removeAllTranslations();
-        startTranslation();
+        retranslatePage();
         sendResponse({ success: true });
         break;
 
@@ -156,8 +178,12 @@
     }
   });
 
+  function getIsTranslating() {
+    return isActive && (inFlight > 0 || queue.length > 0);
+  }
+
   // ============================================================
-  // 翻译主逻辑
+  // 翻译主逻辑：连续优先级调度
   // ============================================================
 
   async function startTranslation() {
@@ -166,28 +192,55 @@
     // 检查排除域名
     if (isDomainExcluded()) return;
 
+    if (!settings.apiKey) {
+      console.warn('[TRS] 未配置 API Key，请右键扩展图标 → 选项 进行配置');
+      return;
+    }
+
     isActive = true;
+    runId++;
+    registry.clear();
+    queue.length = 0;
     document.body.classList.add('trs-active');
     showToast('🌐 翻译已开启', 'on');
 
     // 开启 DOM 变化监听
     setupMutationObserver();
 
-    await translateVisibleContent();
+    // 立即收集 + 调度
+    refresh(true);
+  }
+
+  /**
+   * 重新翻译：清空译文与登记表后重跑，保证重新走 API（而非命中旧缓存）
+   */
+  function retranslatePage() {
+    runId++; // 在途结果作废
+    registry.clear();
+    queue.length = 0;
+    removeAllTranslations();
+    if (isActive) {
+      refresh(true);
+    } else {
+      startTranslation();
+    }
   }
 
   function stopTranslation() {
+    if (!isActive && queue.length === 0 && inFlight === 0) return;
     isActive = false;
-    isTranslating = false;
+    runId++; // 在途结果全部作废
+    registry.clear();
+    queue.length = 0;
 
     // 断开 DOM 监听，避免翻译关闭后仍持续消耗资源
     if (observer) {
       observer.disconnect();
       observer = null;
     }
-    if (debounceTimer) {
-      clearTimeout(debounceTimer);
-      debounceTimer = null;
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
     }
 
     removeAllTranslations();
@@ -198,7 +251,6 @@
     const translations = document.querySelectorAll('.trs-translation');
     translations.forEach(el => el.remove());
     translatedElements = new WeakSet();
-    seenTexts.clear();
     document.body.classList.remove('trs-active');
   }
 
@@ -212,58 +264,113 @@
     styleEl.textContent = generateDynamicCSS();
   }
 
-  async function translateVisibleContent() {
-    if (!isActive || isTranslating) return;
-    if (!settings.apiKey) {
-      console.warn('[TRS] 未配置 API Key，请右键扩展图标 → 选项 进行配置');
+  /**
+   * 收集未处理文本块并按距视口距离排序（最近优先）。
+   * 相同文本只在 registry 中登记一次；新出现的同文元素挂到既有 entry 上。
+   * @param {boolean} immediate 为 true 时跳过节流立即执行
+   */
+  function refresh(immediate) {
+    if (!isActive) return;
+
+    if (!immediate) {
+      if (refreshTimer) return; // 已排队，等待统一执行
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        refresh(true);
+      }, 250);
       return;
     }
 
-    isTranslating = true;
-
     try {
-      // 收集需要翻译的文本块（可视区域优先）
-      let textBlocks = collectTranslatableTexts();
-
-      if (textBlocks.length === 0) {
-        return;
-      }
-
-      // 分批翻译：小块批次让每个 API 请求更快返回，避免超时被整批重试
-      // 分波次发送，每波之间重新收集滚动加载的新内容，新推文能及时得到翻译
-      const BATCH_SIZE = 8;
-      const WAVE_SIZE = BATCH_SIZE * 6; // 每波约 6 个并发批次（与 background 默认并发一致）
-      let offset = 0;
-
-      while (offset < textBlocks.length && isActive) {
-        const waveBlocks = textBlocks.slice(offset, offset + WAVE_SIZE);
-        offset += waveBlocks.length;
-
-        const batchPromises = [];
-        for (let i = 0; i < waveBlocks.length; i += BATCH_SIZE) {
-          const batch = waveBlocks.slice(i, i + BATCH_SIZE);
-          batchPromises.push(translateBatch(batch));
-        }
-
-        await Promise.allSettled(batchPromises);
-
-        // 波次之间重新收集（X 滚动会懒加载新推文），插入到剩余队列尾部
-        if (isActive && offset < textBlocks.length) {
-          const freshBlocks = collectTranslatableTexts();
-          if (freshBlocks.length > 0) {
-            textBlocks = textBlocks.concat(freshBlocks);
-          }
-        }
-      }
-    } finally {
-      isTranslating = false;
+      const candidates = collectFromRoot(document.body, MAX_BLOCKS_PER_SCAN);
+      enqueue(candidates);
+      pump();
+    } catch (e) {
+      console.error('[TRS] 收集失败:', e);
     }
   }
 
-  async function translateBatch(batch) {
+  let refreshTimer = null;
+
+  function enqueue(candidates) {
+    for (const entry of candidates) {
+      if (entry.done || entry.queued || entry.inFlight) continue;
+      if (queue.length >= QUEUE_MAX) {
+        // 队列已满：丢弃最远的（会随滚动/变化重新收集）
+        continue;
+      }
+      entry.queued = true;
+      queue.push(entry);
+    }
+    pruneRegistry();
+  }
+
+  /**
+   * 持续泵送：只要有空闲并发槽且队列非空，就取距离视口最近的一批发送。
+   * 一批返回立即补下一批，不存在等待整波的屏障。
+   */
+  function pump() {
     if (!isActive) return;
 
-    const texts = batch.map(b => b.text);
+    const maxConcurrent = Math.min(Math.max(settings.maxConcurrent || 6, 1), 10);
+
+    while (inFlight < maxConcurrent && queue.length > 0) {
+      // 出队前刷新距离（用户可能已滚动），按「距离 + 失败惩罚」排序
+      for (const entry of queue) {
+        refreshEntryDistance(entry);
+      }
+      queue.sort((a, b) => (a.distance + a.retries * 5000) - (b.distance + b.retries * 5000));
+
+      const batch = queue.splice(0, BATCH_SIZE);
+      for (const entry of batch) {
+        entry.queued = false;
+        entry.inFlight = true;
+      }
+
+      const myRunId = runId;
+      inFlight++;
+      translateBatch(batch).finally(() => {
+        inFlight--;
+        if (myRunId === runId) {
+          pump();
+          maybeIdleCollect();
+        }
+      });
+    }
+  }
+
+  /**
+   * 队列与在途都空时：再做一次全页收集。
+   * 覆盖单页超过 300 块的静态长页面（按 300 一茬滚动推进）。
+   */
+  function maybeIdleCollect() {
+    if (!isActive || queue.length > 0 || inFlight > 0) return;
+    const candidates = collectFromRoot(document.body, MAX_BLOCKS_PER_SCAN);
+    if (candidates.length > 0) {
+      enqueue(candidates);
+      pump();
+    }
+  }
+
+  function refreshEntryDistance(entry) {
+    if (entry.elements.size === 0) {
+      entry.distance = Infinity;
+      return;
+    }
+    let minDistance = Infinity;
+    for (const el of entry.elements) {
+      if (!el.isConnected) continue;
+      const rect = el.getBoundingClientRect();
+      const center = rect.top + rect.height / 2;
+      const viewportCenter = window.innerHeight / 2;
+      const dist = Math.abs(center - viewportCenter);
+      if (dist < minDistance) minDistance = dist;
+    }
+    entry.distance = minDistance;
+  }
+
+  async function translateBatch(entries) {
+    const texts = entries.map(e => e.text);
 
     try {
       const response = await chrome.runtime.sendMessage({
@@ -278,22 +385,62 @@
 
       if (response.error) {
         console.error('[TRS] 翻译错误:', response.error);
+        requeueFailed(entries);
         return;
       }
 
       const translations = response.translations || [];
 
-      // 注入译文（跳过与原文相同的无效翻译）
-      batch.forEach((block, index) => {
-        const translation = translations[index];
-        if (translation && translation.trim()) {
-          // 原文与译文相同时跳过（如用户名、仓库名等专有名词）
-          if (translation.trim().toLowerCase() === block.text.toLowerCase()) return;
-          injectTranslation(block.element, translation);
+      entries.forEach((entry, index) => {
+        const translation = (translations[index] || '').trim();
+        entry.inFlight = false;
+
+        if (!translation) {
+          // 空译文按失败处理
+          requeueFailedEntry(entry);
+          return;
+        }
+
+        // 原文与译文相同时跳过注入（如用户名、仓库名等专有名词）
+        if (translation.toLowerCase() === entry.text.toLowerCase()) {
+          for (const el of entry.elements) translatedElements.add(el);
+          entry.done = true;
+          entry.translation = '';
+          return;
+        }
+
+        entry.done = true;
+        entry.translation = translation;
+        for (const el of entry.elements) {
+          if (el.isConnected) {
+            injectTranslation(el, translation);
+            translatedElements.add(el);
+          }
         }
       });
     } catch (err) {
       console.error('[TRS] 翻译请求失败:', err.message);
+      requeueFailed(entries);
+    }
+  }
+
+  function requeueFailed(entries) {
+    for (const entry of entries) requeueFailedEntry(entry);
+  }
+
+  function requeueFailedEntry(entry) {
+    entry.inFlight = false;
+    if (!isActive) return;
+    if (entry.retries < RETRY_LIMIT) {
+      entry.retries++;
+      if (!entry.queued && queue.length < QUEUE_MAX) {
+        entry.queued = true;
+        queue.push(entry);
+      }
+    } else {
+      // 超过重试上限：标记完成避免反复重试，用户重新翻译页面可恢复
+      entry.done = true;
+      entry.translation = '';
     }
   }
 
@@ -301,11 +448,14 @@
   // 文本收集
   // ============================================================
 
-  function collectTranslatableTexts() {
-    const blocks = [];
-    const MAX_BLOCKS = 300;
+  /**
+   * 从指定根元素收集可翻译文本块。
+   * 返回需要入队的 entry 列表（未翻译、未排队、未在途）。
+   */
+  function collectFromRoot(root, maxBlocks) {
+    const candidates = [];
 
-    const elements = document.body.querySelectorAll(BLOCK_SELECTORS);
+    const elements = root.querySelectorAll(BLOCK_SELECTORS);
 
     // x.com 上收集所有 tweetText 容器，用于跳过其子元素
     const tweetTextContainers = isXDomain
@@ -313,7 +463,7 @@
       : null;
 
     for (const el of elements) {
-      if (blocks.length >= MAX_BLOCKS) break;
+      if (candidates.length >= maxBlocks) break;
 
       // 跳过应忽略的元素
       if (el.closest(SKIP_SELECTORS)) continue;
@@ -333,6 +483,9 @@
         }
       }
 
+      // 跳过零尺寸/隐藏元素（站内隐藏抽屉、菜单、隐藏 toast 等）
+      if (isEffectivelyHidden(el)) continue;
+
       // 获取直接文本内容（不包括子元素中已被处理的内容）
       const text = getDirectText(el);
       if (!text || text.length < 2) continue;
@@ -347,30 +500,66 @@
       const textRatio = text.replace(/[\s\d.,;:!?\-–—()（）《》【】\[\]"'`·•・…]/g, '').length / text.length;
       if (textRatio < 0.3) continue;
 
-      // 跨批次去重（相同文本只翻译一次）
+      // 登记到 registry：相同文本共享一次 API 调用
       const normalized = text.trim().toLowerCase();
-      if (seenTexts.has(normalized)) continue;
-      // 限制 Set 大小，超出时清空一半（防止长时间浏览 SPA 页面内存泄漏）
-      if (seenTexts.size >= SEEN_TEXTS_MAX) {
-        const entries = Array.from(seenTexts);
-        seenTexts.clear();
-        entries.slice(-Math.floor(SEEN_TEXTS_MAX / 2)).forEach(e => seenTexts.add(e));
+      let entry = registry.get(normalized);
+      if (!entry) {
+        entry = {
+          key: normalized,
+          text: text.trim(),
+          elements: new Set(),
+          retries: 0,
+          done: false,
+          translation: '',
+          queued: false,
+          inFlight: false,
+          distance: Infinity,
+        };
+        registry.set(normalized, entry);
       }
-      seenTexts.add(normalized);
 
-      blocks.push({ element: el, text: text.trim() });
+      entry.elements.add(el);
+
+      if (entry.done) {
+        // 已有译文：新出现的同文元素直接注入，无需 API
+        if (entry.translation) {
+          injectTranslation(el, entry.translation);
+        }
+        translatedElements.add(el);
+        continue;
+      }
+
+      if (!entry.queued && !entry.inFlight && !candidates.includes(entry)) {
+        candidates.push(entry);
+      }
     }
 
-    // 可视区域优先：视口内的块排在前面，其余按距视口距离排序
-    const viewportHeight = window.innerHeight;
-    for (const block of blocks) {
-      const rect = block.element.getBoundingClientRect();
-      block.inViewport = rect.bottom > 0 && rect.top < viewportHeight;
-      block.distance = block.inViewport ? 0 : Math.abs(rect.top);
+    // 可视区域优先排序（入队顺序决定初始次序，出队时还会按实时距离重排）
+    for (const entry of candidates) {
+      refreshEntryDistance(entry);
     }
-    blocks.sort((a, b) => a.distance - b.distance);
+    candidates.sort((a, b) => a.distance - b.distance);
 
-    return blocks;
+    return candidates;
+  }
+
+  const styleCache = new WeakMap();
+
+  /**
+   * 判断元素是否实际不可见（display:none / visibility:hidden / 零尺寸）。
+   * 零尺寸检查同时覆盖祖先 display:none 的情况（此时 rect 为 0）。
+   */
+  function isEffectivelyHidden(el) {
+    let cached = styleCache.get(el);
+    if (!cached) {
+      const style = window.getComputedStyle(el);
+      cached = { display: style.display, visibility: style.visibility };
+      styleCache.set(el, cached);
+    }
+    if (cached.display === 'none' || cached.visibility === 'hidden') return true;
+
+    const rect = el.getBoundingClientRect();
+    return rect.width === 0 && rect.height === 0;
   }
 
   function getDirectText(element) {
@@ -420,6 +609,20 @@
     }
     blockCache.set(el, found);
     return found;
+  }
+
+  /**
+   * 登记表瘦身：条目过多时清理所有元素都已脱离 DOM 的条目。
+   */
+  function pruneRegistry() {
+    if (registry.size < REGISTRY_MAX) return;
+    for (const [key, entry] of registry) {
+      let anyConnected = false;
+      for (const el of entry.elements) {
+        if (el.isConnected) { anyConnected = true; break; }
+      }
+      if (!anyConnected) registry.delete(key);
+    }
   }
 
   /**
@@ -486,21 +689,6 @@
     element.appendChild(translationEl);
 
     translatedElements.add(element);
-  }
-
-  /**
-   * 获取元素背后实际可见的背景色（向上遍历直到找到非透明背景）
-   */
-  function getEffectiveBackground(el) {
-    let current = el;
-    while (current && current !== document.body.parentElement) {
-      const bg = window.getComputedStyle(current).backgroundColor;
-      if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
-        return bg;
-      }
-      current = current.parentElement;
-    }
-    return 'rgb(255, 255, 255)';
   }
 
   /**
@@ -591,7 +779,7 @@
     if (observer) return;
 
     observer = new MutationObserver((mutations) => {
-      if (!isActive || isTranslating) return;
+      if (!isActive) return;
 
       let hasNewContent = false;
       for (const mutation of mutations) {
@@ -617,7 +805,8 @@
       }
 
       if (hasNewContent) {
-        debounceTranslate();
+        // 不设长防抖：新内容立即进入优先级队列，调度器会按距离排序
+        refresh(false);
       }
     });
 
@@ -644,12 +833,23 @@
     }
   }
 
-  let debounceTimer = null;
-  function debounceTranslate() {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      translateVisibleContent();
-    }, 1500);
+  // ============================================================
+  // 滚动监听：静态长页面滚入未翻译区域时补充收集
+  // ============================================================
+
+  let scrollTimer = null;
+
+  function setupScrollListener() {
+    window.addEventListener('scroll', () => {
+      if (!isActive) return;
+      // 队列充实时不打扰（新滚入的内容已在队列里，出队时会优先）
+      if (queue.length + inFlight * BATCH_SIZE >= 60) return;
+      if (scrollTimer) return;
+      scrollTimer = setTimeout(() => {
+        scrollTimer = null;
+        if (isActive) refresh(true);
+      }, 400);
+    }, { passive: true });
   }
 
   // ============================================================

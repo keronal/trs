@@ -60,10 +60,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (styleRadio) styleRadio.checked = true;
 
     fontSizeSelect.value = currentSettings.fontSize || '0.92em';
-    maxConcurrentSelect.value = String(currentSettings.maxConcurrent || 6);
-    // 旧版本存储的值（如 5/8）不在新选项中时，回退到默认值
+    maxConcurrentSelect.value = String(currentSettings.maxConcurrent || 8);
+    // 旧版本存储的值（如 5/7）不在新选项中时，回退到默认值
     if (maxConcurrentSelect.selectedIndex === -1) {
-      maxConcurrentSelect.value = '6';
+      maxConcurrentSelect.value = '8';
     }
 
     const domains = currentSettings.excludedDomains || [];

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TRS - 智能双语翻译",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "基于 DeepSeek AI 的网页双语翻译扩展，原文译文对照显示，流畅不卡顿。",
   "permissions": [
     "storage",

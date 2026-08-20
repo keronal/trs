@@ -21,7 +21,9 @@
   let runId = 0;               // 每次 start/stop 递增，使在途结果失效
   let settings = {};
   let observer = null;
-  let translatedElements = new WeakSet();
+  // 已翻译元素及其翻译时的原文快照：element -> originalText
+  // 收集时若元素当前文本与快照不一致（如 X 的 "Show more" 展开），则取消标记并重新翻译
+  let translatedElements = new WeakMap();
 
   // 文本登记表：normalizedText -> entry
   // entry = { key, text, elements:Set<Element>, retries, done, translation, queued, inFlight, distance }
@@ -105,6 +107,9 @@
 
     // 滚动监听：静态长页面滚入未翻译区域时补充收集
     setupScrollListener();
+
+    // X "Show more/Show less" 展开监听：点击后触发重新收集
+    setupShowMoreListener();
 
     // 注入动态样式元素
     injectDynamicStyle();
@@ -250,7 +255,7 @@
   function removeAllTranslations() {
     const translations = document.querySelectorAll('.trs-translation');
     translations.forEach(el => el.remove());
-    translatedElements = new WeakSet();
+    translatedElements = new WeakMap();
     document.body.classList.remove('trs-active');
   }
 
@@ -403,7 +408,7 @@
 
         // 原文与译文相同时跳过注入（如用户名、仓库名等专有名词）
         if (translation.toLowerCase() === entry.text.toLowerCase()) {
-          for (const el of entry.elements) translatedElements.add(el);
+          for (const el of entry.elements) translatedElements.set(el, entry.text);
           entry.done = true;
           entry.translation = '';
           return;
@@ -450,11 +455,14 @@
     for (const el of connected) {
       if (!translation) break;
       if (coveredByAncestor.has(el)) {
-        translatedElements.add(el); // 已被祖先译文覆盖，标记即可
+        translatedElements.set(el, entry.text); // 已被祖先译文覆盖，标记即可
         continue;
       }
-      injectTranslation(el, translation);
-      translatedElements.add(el);
+      // 元素当前文本已与条目文本不一致（如被 "Show more" 展开）→ 跳过，
+      // 避免用旧译文覆盖新译文；展开后的新文本会在下次收集时按快照校验重新翻译
+      if (getDirectText(el) !== entry.text) continue;
+      injectTranslation(el, translation, entry.text);
+      translatedElements.set(el, entry.text);
     }
   }
 
@@ -503,7 +511,12 @@
       // 跳过应忽略的元素
       if (el.closest(SKIP_SELECTORS)) continue;
       if (el.matches(SKIP_SELECTORS)) continue;
-      if (translatedElements.has(el)) continue;
+      // 已翻译元素：若当前文本与翻译时快照一致则跳过；
+      // 若因 "Show more" 展开等原因内容变化，则取消标记并按新文本重新收集翻译
+      if (translatedElements.has(el)) {
+        if (getDirectText(el) === translatedElements.get(el)) continue;
+        translatedElements.delete(el);
+      }
 
       // x.com 特殊处理：跳过 UI 标注元素（用户名、时间戳、社交上下文等）
       if (isXDomain) {
@@ -564,7 +577,7 @@
         if (entry.translation) {
           touchedDone.add(entry); // 延迟到扫描结束后统一注入（嵌套去重需要全集）
         } else {
-          translatedElements.add(el); // 原文=译文，无需注入
+          translatedElements.set(el, entry.text); // 原文=译文，无需注入
         }
         continue;
       }
@@ -723,13 +736,14 @@
   // 译文注入（作为子元素追加，不破坏 DOM 结构）
   // ============================================================
 
-  function injectTranslation(element, translation) {
+  function injectTranslation(element, translation, originalText) {
     if (!translation || !translation.trim()) return;
 
     // 避免重复注入
     const existing = element.querySelector(':scope > .trs-translation');
     if (existing) {
       existing.textContent = translation.trim();
+      if (originalText != null) translatedElements.set(element, originalText);
       return;
     }
 
@@ -749,7 +763,27 @@
     // 统一追加为元素的最后一个子节点
     element.appendChild(translationEl);
 
-    translatedElements.add(element);
+    // 记录原文快照，供后续收集时校验内容是否变化（如 "Show more" 展开）
+    translatedElements.set(element, originalText != null ? originalText : getDirectText(element));
+  }
+
+  /**
+   * 页面重渲染删除了译文节点时，从登记表立即恢复译文（无需重新调用 API）。
+   * 同文嵌套被祖先译文覆盖的元素不重复注入。
+   */
+  function restoreTranslation(element) {
+    // 已有祖先译文覆盖时不重复注入（同文嵌套去重）
+    let anc = element.parentElement;
+    while (anc && anc !== document.body) {
+      if (anc.querySelector(':scope > .trs-translation')) return;
+      anc = anc.parentElement;
+    }
+    const text = getDirectText(element);
+    if (!text) return;
+    const entry = registry.get(text.trim().toLowerCase());
+    if (entry && entry.done && entry.translation) {
+      injectTranslation(element, entry.translation, entry.text);
+    }
   }
 
   /**
@@ -843,29 +877,78 @@
       if (!isActive) return;
 
       let hasNewContent = false;
-      for (const mutation of mutations) {
-        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-          for (const node of mutation.addedNodes) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              // 跳过译文自身或已标记忽略的元素
-              if (node.hasAttribute && node.hasAttribute('data-trs-ignore')) continue;
-              if (node.classList && node.classList.contains('trs-translation')) continue;
+      let translatedContentChanged = false;
 
-              if (node.querySelector && node.querySelector(BLOCK_SELECTORS)) {
-                hasNewContent = true;
-                break;
-              }
-              if (node.matches && node.matches(BLOCK_SELECTORS)) {
-                hasNewContent = true;
-                break;
-              }
+      /** 判断节点是否为扩展自身注入的译文节点 */
+      const isTrsNode = (node) =>
+        node.nodeType === Node.ELEMENT_NODE &&
+        ((node.hasAttribute && node.hasAttribute('data-trs-ignore')) ||
+         (node.classList && node.classList.contains('trs-translation')));
+
+      /** 从起始元素向上查找已翻译元素并取消其"已翻译"标记 */
+      const unmarkTranslatedAncestor = (start) => {
+        let el = start;
+        while (el && el !== document.body) {
+          if (translatedElements.has(el)) {
+            translatedElements.delete(el);
+            translatedContentChanged = true;
+            return;
+          }
+          el = el.parentElement;
+        }
+      };
+
+      for (const mutation of mutations) {
+        if (mutation.type === 'childList') {
+          // 页面替换/扩展了已翻译元素的内容（如 X 的 "Show more" 展开）：
+          // 变更里包含非译文节点时，取消目标元素及其祖先的"已翻译"标记，
+          // 让收集器按展开后的新文本重新翻译
+          let hasForeignNodes = false;
+          for (const node of mutation.addedNodes) {
+            if (!isTrsNode(node)) { hasForeignNodes = true; break; }
+          }
+          if (!hasForeignNodes) {
+            for (const node of mutation.removedNodes) {
+              if (!isTrsNode(node)) { hasForeignNodes = true; break; }
             }
           }
+          if (hasForeignNodes) {
+            unmarkTranslatedAncestor(mutation.target);
+          }
+
+          // 页面删除了我们注入的译文节点（如 React 重渲染覆盖）→ 立即从登记表恢复
+          for (const node of mutation.removedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE &&
+                node.classList && node.classList.contains('trs-translation') &&
+                mutation.target && mutation.target.isConnected) {
+              restoreTranslation(mutation.target);
+              break;
+            }
+          }
+
+          // 检测新增内容节点（不含译文节点），用于触发收集
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== Node.ELEMENT_NODE) continue;
+            if (isTrsNode(node)) continue;
+
+            if (node.querySelector && node.querySelector(BLOCK_SELECTORS)) {
+              hasNewContent = true;
+            }
+            if (node.matches && node.matches(BLOCK_SELECTORS)) {
+              hasNewContent = true;
+            }
+          }
+        } else if (mutation.type === 'characterData') {
+          // 文本节点直接变化：若位于已翻译元素内则取消标记
+          // （排除扩展自身更新译文字本的 characterData 变更）
+          const parentEl = mutation.target.parentElement;
+          if (parentEl && !(parentEl.classList && parentEl.classList.contains('trs-translation'))) {
+            unmarkTranslatedAncestor(parentEl);
+          }
         }
-        if (hasNewContent) break;
       }
 
-      if (hasNewContent) {
+      if (hasNewContent || translatedContentChanged) {
         // 不设长防抖：新内容立即进入优先级队列，调度器会按距离排序
         refresh(false);
       }
@@ -911,6 +994,25 @@
         if (isActive) refresh(true);
       }, 400);
     }, { passive: true });
+  }
+
+  /**
+   * X 推文的 "Show more" / "Show less" 展开或折叠监听。
+   * 点击后等 React 提交 DOM 更新，再触发一次收集；
+   * 展开后的新文本会由快照校验识别并重新翻译（不依赖 MutationObserver 时机）。
+   */
+  function setupShowMoreListener() {
+    document.addEventListener('click', (event) => {
+      if (!isActive) return;
+      const el = event.target;
+      if (!el || !el.closest) return;
+      const btn = el.closest(
+        '[data-testid="tweet-text-show-more-link"], [data-testid="tweet-text-show-less-link"], [data-testid="tweetText"]'
+      );
+      if (!btn) return;
+      // 等待 React 提交 DOM 更新后再收集；快照校验会识别展开后的新文本
+      setTimeout(() => { if (isActive) refresh(true); }, 200);
+    }, true);
   }
 
   // ============================================================

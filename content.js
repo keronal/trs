@@ -2,7 +2,7 @@
 // TRS Content Script
 // 页面文本提取、译文注入、动态内容监听
 //
-// 调度模型（v2）：连续优先级队列
+// 调度模型（v3）：低延迟连续优先级队列
 // - 所有待译文本登记到 registry（按文本去重，同文多元素共享一次 API 调用）
 // - 队列按「距视口距离」动态排序，出队时取最近的一批
 // - 无波次屏障：一批返回立即补下一批，慢请求只占一个并发槽
@@ -32,6 +32,8 @@
   let inFlight = 0;
 
   const BATCH_SIZE = 8;
+  const VISIBLE_BATCH_SIZE = 4;      // 视口附近用小批次，缩短首批译文等待时间
+  const MUTATION_REFRESH_DELAY = 60; // 合并同一渲染帧附近的 DOM 变化，同时保持快速响应
   const MAX_BLOCKS_PER_SCAN = 300;   // 单次全页扫描收集上限
   const QUEUE_MAX = 600;             // 队列长度上限，防止无限滚动页内存膨胀
   const REGISTRY_MAX = 4000;         // 登记表上限，超出时清理已脱离 DOM 的条目
@@ -146,32 +148,31 @@
         break;
 
       case 'STOP_TRANSLATION':
-        stopTranslation();
-        sendResponse({ success: true });
-        break;
+        stopTranslation().then(() => sendResponse({ success: true }));
+        return true;
 
       case 'TOGGLE_TRANSLATION':
-        if (isActive) {
-          stopTranslation();
-        } else {
-          startTranslation();
-        }
-        sendResponse({ success: true, isActive });
-        break;
+        (async () => {
+          if (isActive) {
+            await stopTranslation();
+          } else {
+            await startTranslation();
+          }
+          sendResponse({ success: true, isActive });
+        })();
+        return true;
 
       case 'GET_STATUS':
         sendResponse({ isActive, isTranslating: getIsTranslating() });
         break;
 
       case 'REMOVE_ALL_TRANSLATIONS':
-        stopTranslation();
-        sendResponse({ success: true });
-        break;
+        stopTranslation().then(() => sendResponse({ success: true }));
+        return true;
 
       case 'RETRANSLATE_PAGE':
-        retranslatePage();
-        sendResponse({ success: true });
-        break;
+        retranslatePage().then(() => sendResponse({ success: true }));
+        return true;
 
       case 'UPDATE_SETTINGS':
         settings = { ...settings, ...message.settings };
@@ -204,6 +205,7 @@
 
     isActive = true;
     runId++;
+    inFlight = 0;
     registry.clear();
     queue.length = 0;
     document.body.classList.add('trs-active');
@@ -219,22 +221,27 @@
   /**
    * 重新翻译：清空译文与登记表后重跑，保证重新走 API（而非命中旧缓存）
    */
-  function retranslatePage() {
+  async function retranslatePage() {
     runId++; // 在途结果作废
+    const myRunId = runId;
+    inFlight = 0;
     registry.clear();
     queue.length = 0;
     removeAllTranslations();
+    await cancelTranslationRequests();
+    if (myRunId !== runId) return;
     if (isActive) {
       refresh(true);
     } else {
-      startTranslation();
+      await startTranslation();
     }
   }
 
-  function stopTranslation() {
+  async function stopTranslation() {
     if (!isActive && queue.length === 0 && inFlight === 0) return;
     isActive = false;
     runId++; // 在途结果全部作废
+    inFlight = 0;
     registry.clear();
     queue.length = 0;
 
@@ -247,9 +254,19 @@
       clearTimeout(refreshTimer);
       refreshTimer = null;
     }
+    pendingRefreshRoots.clear();
 
     removeAllTranslations();
     showToast('🚫 翻译已关闭', 'off');
+    await cancelTranslationRequests();
+  }
+
+  async function cancelTranslationRequests() {
+    try {
+      await chrome.runtime.sendMessage({ type: 'CANCEL_TRANSLATIONS' });
+    } catch (e) {
+      // Service worker 被回收时无需阻塞本地状态切换。
+    }
   }
 
   function removeAllTranslations() {
@@ -274,20 +291,23 @@
    * 相同文本只在 registry 中登记一次；新出现的同文元素挂到既有 entry 上。
    * @param {boolean} immediate 为 true 时跳过节流立即执行
    */
-  function refresh(immediate) {
+  function refresh(immediate, root = document.body) {
     if (!isActive) return;
 
     if (!immediate) {
-      if (refreshTimer) return; // 已排队，等待统一执行
-      refreshTimer = setTimeout(() => {
-        refreshTimer = null;
-        refresh(true);
-      }, 250);
+      scheduleRefreshRoot(root);
       return;
     }
 
+    if (!root || !root.querySelectorAll) return;
+    if (root === document.body) {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = null;
+      pendingRefreshRoots.clear();
+    }
+
     try {
-      const candidates = collectFromRoot(document.body, MAX_BLOCKS_PER_SCAN);
+      const candidates = collectFromRoot(root, MAX_BLOCKS_PER_SCAN);
       enqueue(candidates);
       pump();
     } catch (e) {
@@ -296,6 +316,49 @@
   }
 
   let refreshTimer = null;
+  const pendingRefreshRoots = new Set();
+
+  function scheduleRefreshRoot(node) {
+    let root = node;
+    if (root?.nodeType === Node.TEXT_NODE) root = root.parentElement;
+    if (!root || root.nodeType !== Node.ELEMENT_NODE || !root.isConnected) return;
+    if (root.closest?.('.trs-translation, [data-trs-ignore]')) return;
+
+    // X 推文按 tweetText 容器统一翻译，子节点变化时提升到该容器。
+    if (isXDomain) root = root.closest?.('[data-testid="tweetText"]') || root;
+
+    // 合并有祖先/后代关系的根，避免同一片 DOM 被重复扫描。
+    for (const existing of pendingRefreshRoots) {
+      if (existing.contains(root)) return;
+      if (root.contains(existing)) pendingRefreshRoots.delete(existing);
+    }
+    pendingRefreshRoots.add(root);
+
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      const roots = [...pendingRefreshRoots];
+      pendingRefreshRoots.clear();
+      if (!isActive) return;
+
+      const candidates = [];
+      const seen = new Set();
+      let remaining = MAX_BLOCKS_PER_SCAN;
+      for (const changedRoot of roots) {
+        if (remaining <= 0) break;
+        if (!changedRoot.isConnected) continue;
+        for (const entry of collectFromRoot(changedRoot, remaining)) {
+          if (seen.has(entry)) continue;
+          seen.add(entry);
+          candidates.push(entry);
+          remaining--;
+          if (remaining <= 0) break;
+        }
+      }
+      enqueue(candidates);
+      pump();
+    }, MUTATION_REFRESH_DELAY);
+  }
 
   function enqueue(candidates) {
     for (const entry of candidates) {
@@ -319,14 +382,14 @@
 
     const maxConcurrent = Math.min(Math.max(settings.maxConcurrent || 6, 1), 10);
 
-    while (inFlight < maxConcurrent && queue.length > 0) {
-      // 出队前刷新距离（用户可能已滚动），按「距离 + 失败惩罚」排序
-      for (const entry of queue) {
-        refreshEntryDistance(entry);
-      }
-      queue.sort((a, b) => (a.distance + a.retries * 5000) - (b.distance + b.retries * 5000));
+    // 一轮泵送只触发布局读取和排序一次，避免初始并发为 8 时连续做 8 次全队列排序。
+    for (const entry of queue) refreshEntryDistance(entry);
+    queue.sort((a, b) => (a.distance + a.retries * 5000) - (b.distance + b.retries * 5000));
 
-      const batch = queue.splice(0, BATCH_SIZE);
+    while (inFlight < maxConcurrent && queue.length > 0) {
+      const isNearViewport = queue[0].distance <= window.innerHeight;
+      const batchSize = isNearViewport ? VISIBLE_BATCH_SIZE : BATCH_SIZE;
+      const batch = queue.splice(0, batchSize);
       for (const entry of batch) {
         entry.queued = false;
         entry.inFlight = true;
@@ -334,12 +397,11 @@
 
       const myRunId = runId;
       inFlight++;
-      translateBatch(batch).finally(() => {
-        inFlight--;
-        if (myRunId === runId) {
-          pump();
-          maybeIdleCollect();
-        }
+      translateBatch(batch, myRunId).finally(() => {
+        if (myRunId !== runId) return;
+        inFlight = Math.max(0, inFlight - 1);
+        pump();
+        maybeIdleCollect();
       });
     }
   }
@@ -374,7 +436,7 @@
     entry.distance = minDistance;
   }
 
-  async function translateBatch(entries) {
+  async function translateBatch(entries, requestRunId) {
     const texts = entries.map(e => e.text);
 
     try {
@@ -386,7 +448,7 @@
         model: settings.model,
       });
 
-      if (!isActive) return; // 等待期间可能已关闭翻译
+      if (!isActive || requestRunId !== runId) return; // 等待期间可能已关闭或重启翻译
 
       if (response.error) {
         console.error('[TRS] 翻译错误:', response.error);
@@ -419,6 +481,7 @@
         injectEntryTranslation(entry);
       });
     } catch (err) {
+      if (!isActive || requestRunId !== runId) return;
       console.error('[TRS] 翻译请求失败:', err.message);
       requeueFailed(entries);
     }
@@ -499,13 +562,21 @@
     const touchedDone = new Set();
 
     const elements = root.querySelectorAll(BLOCK_SELECTORS);
+    const rootIsCandidate = root.nodeType === Node.ELEMENT_NODE &&
+      root.matches && root.matches(BLOCK_SELECTORS);
 
     // x.com 上收集所有 tweetText 容器，用于跳过其子元素
     const tweetTextContainers = isXDomain
       ? new Set(document.querySelectorAll('[data-testid="tweetText"]'))
       : null;
 
-    for (const el of elements) {
+    function* matchingElements() {
+      if (rootIsCandidate) yield root;
+      yield* elements;
+    }
+
+    const candidateSet = new Set();
+    for (const el of matchingElements()) {
       if (candidates.length >= maxBlocks) break;
 
       // 跳过应忽略的元素
@@ -582,7 +653,8 @@
         continue;
       }
 
-      if (!entry.queued && !entry.inFlight && !candidates.includes(entry)) {
+      if (!entry.queued && !entry.inFlight && !candidateSet.has(entry)) {
+        candidateSet.add(entry);
         candidates.push(entry);
       }
     }
@@ -878,6 +950,7 @@
 
       let hasNewContent = false;
       let translatedContentChanged = false;
+      const changedRoots = new Set();
 
       /** 判断节点是否为扩展自身注入的译文节点 */
       const isTrsNode = (node) =>
@@ -892,10 +965,11 @@
           if (translatedElements.has(el)) {
             translatedElements.delete(el);
             translatedContentChanged = true;
-            return;
+            return el;
           }
           el = el.parentElement;
         }
+        return null;
       };
 
       for (const mutation of mutations) {
@@ -913,7 +987,7 @@
             }
           }
           if (hasForeignNodes) {
-            unmarkTranslatedAncestor(mutation.target);
+            changedRoots.add(unmarkTranslatedAncestor(mutation.target) || mutation.target);
           }
 
           // 页面删除了我们注入的译文节点（如 React 重渲染覆盖）→ 立即从登记表恢复
@@ -928,14 +1002,20 @@
 
           // 检测新增内容节点（不含译文节点），用于触发收集
           for (const node of mutation.addedNodes) {
+            if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+              hasNewContent = true;
+              changedRoots.add(node.parentElement || mutation.target);
+              continue;
+            }
             if (node.nodeType !== Node.ELEMENT_NODE) continue;
             if (isTrsNode(node)) continue;
 
-            if (node.querySelector && node.querySelector(BLOCK_SELECTORS)) {
+            const containsTextBlock =
+              (node.matches && node.matches(BLOCK_SELECTORS)) ||
+              (node.querySelector && node.querySelector(BLOCK_SELECTORS));
+            if (containsTextBlock) {
               hasNewContent = true;
-            }
-            if (node.matches && node.matches(BLOCK_SELECTORS)) {
-              hasNewContent = true;
+              changedRoots.add(node);
             }
           }
         } else if (mutation.type === 'characterData') {
@@ -943,14 +1023,15 @@
           // （排除扩展自身更新译文字本的 characterData 变更）
           const parentEl = mutation.target.parentElement;
           if (parentEl && !(parentEl.classList && parentEl.classList.contains('trs-translation'))) {
-            unmarkTranslatedAncestor(parentEl);
+            hasNewContent = Boolean(mutation.target.textContent.trim());
+            changedRoots.add(unmarkTranslatedAncestor(parentEl) || parentEl);
           }
         }
       }
 
       if (hasNewContent || translatedContentChanged) {
         // 不设长防抖：新内容立即进入优先级队列，调度器会按距离排序
-        refresh(false);
+        for (const root of changedRoots) refresh(false, root);
       }
     });
 
@@ -958,6 +1039,7 @@
     if (document.body) {
       observer.observe(document.body, {
         childList: true,
+        characterData: true,
         subtree: true,
       });
     } else {
@@ -966,6 +1048,7 @@
         if (document.body) {
           observer.observe(document.body, {
             childList: true,
+            characterData: true,
             subtree: true,
           });
         }
@@ -992,7 +1075,7 @@
       scrollTimer = setTimeout(() => {
         scrollTimer = null;
         if (isActive) refresh(true);
-      }, 400);
+      }, 120);
     }, { passive: true });
   }
 

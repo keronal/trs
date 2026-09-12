@@ -3,7 +3,7 @@
 // 处理翻译请求队列、DeepSeek API 调用、缓存管理
 // ============================================================
 
-const DEEPSEEK_API_BASE = 'https://api.deepseek.com/v1';
+const DEEPSEEK_API_BASE = 'https://api.deepseek.com';
 const DEFAULT_MAX_CONCURRENT = 8;
 const MAX_RETRIES = 2;
 // 内容侧已改为连续优先级调度，挂起请求只占用一个并发槽（不会阻塞整条管线），
@@ -21,6 +21,8 @@ let cacheSaveTimer = null;
 let activeRequests = 0;
 let maxConcurrent = DEFAULT_MAX_CONCURRENT;
 const pendingQueue = [];
+// 每个标签页正在进行的请求；停止/重译时立即中断旧请求，释放并发槽。
+const activeControllersByTab = new Map();
 
 // 初始化时加载设置 + 恢复持久化缓存
 (async function init() {
@@ -82,8 +84,8 @@ function hashText(text) {
   return hash.toString(36);
 }
 
-function getCacheKey(text, targetLang) {
-  return `${targetLang}:${hashText(text)}`;
+function getCacheKey(text, targetLang, model) {
+  return `${model || 'deepseek-flash'}:${targetLang}:${hashText(text)}`;
 }
 
 function addToCache(key, translation) {
@@ -104,12 +106,15 @@ function addToCache(key, translation) {
 // DeepSeek API 调用
 // ============================================================
 
-async function callDeepSeekAPI(texts, targetLang, apiKey, model) {
+async function callDeepSeekAPI(texts, targetLang, apiKey, model, controller) {
   const systemPrompt = getSystemPrompt(targetLang);
   const userContent = texts.map((t, i) => `[${i}] ${t}`).join('\n\n');
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT);
 
   try {
     const response = await fetch(`${DEEPSEEK_API_BASE}/chat/completions`, {
@@ -119,11 +124,13 @@ async function callDeepSeekAPI(texts, targetLang, apiKey, model) {
         'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: model || 'deepseek-v4-flash',
+        model: model || 'deepseek-flash',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userContent },
         ],
+        // DeepSeek 当前模型默认开启 high 思考。网页翻译是直接转换任务，关闭思考可显著降低首字延迟。
+        thinking: { type: 'disabled' },
         temperature: 0.1,
         max_tokens: 4096,
       }),
@@ -144,6 +151,11 @@ async function callDeepSeekAPI(texts, targetLang, apiKey, model) {
     return parseBatchResult(rawOutput, texts.length);
   } catch (err) {
     clearTimeout(timeoutId);
+    if (err.name === 'AbortError' && !timedOut) {
+      const cancelled = new Error('翻译请求已取消');
+      cancelled.name = 'CancelledError';
+      throw cancelled;
+    }
     if (err.name === 'AbortError') {
       throw new Error('翻译请求超时，请检查网络或稍后重试');
     }
@@ -221,19 +233,95 @@ function parseBatchResult(rawOutput, expectedCount) {
 // 带重试的翻译
 // ============================================================
 
-async function translateWithRetry(texts, targetLang, apiKey, model, retries = MAX_RETRIES) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const results = await callDeepSeekAPI(texts, targetLang, apiKey, model);
-      return results;
-    } catch (err) {
-      if (attempt < retries) {
-        const delay = Math.pow(2, attempt) * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-        continue;
-      }
-      throw err;
+function trackController(tabId, controller) {
+  if (tabId == null) return;
+  let controllers = activeControllersByTab.get(tabId);
+  if (!controllers) {
+    controllers = new Set();
+    activeControllersByTab.set(tabId, controllers);
+  }
+  controllers.add(controller);
+}
+
+function untrackController(tabId, controller) {
+  if (tabId == null) return;
+  const controllers = activeControllersByTab.get(tabId);
+  if (!controllers) return;
+  controllers.delete(controller);
+  if (controllers.size === 0) activeControllersByTab.delete(tabId);
+}
+
+function createCancelledError() {
+  const error = new Error('翻译请求已取消');
+  error.name = 'CancelledError';
+  return error;
+}
+
+function abortableDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(createCancelledError());
+      return;
     }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createCancelledError());
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function translateWithRetry(texts, targetLang, apiKey, model, tabId, retries = MAX_RETRIES) {
+  const cancelController = new AbortController();
+  trackController(tabId, cancelController);
+
+  try {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (cancelController.signal.aborted) throw createCancelledError();
+
+      const requestController = new AbortController();
+      const cancelRequest = () => requestController.abort();
+      cancelController.signal.addEventListener('abort', cancelRequest, { once: true });
+
+      try {
+        return await callDeepSeekAPI(texts, targetLang, apiKey, model, requestController);
+      } catch (err) {
+        if (cancelController.signal.aborted || err.name === 'CancelledError') {
+          throw createCancelledError();
+        }
+        if (attempt >= retries) throw err;
+      } finally {
+        cancelController.signal.removeEventListener('abort', cancelRequest);
+      }
+
+      await abortableDelay(Math.pow(2, attempt) * 1000, cancelController.signal);
+    }
+  } finally {
+    untrackController(tabId, cancelController);
+  }
+}
+
+function cancelTabRequests(tabId) {
+  if (tabId == null) return;
+
+  // 先移除尚未发出的任务。
+  for (let i = pendingQueue.length - 1; i >= 0; i--) {
+    const task = pendingQueue[i];
+    if (task.tabId === tabId) {
+      task.resolve(new Array(task.resultLength).fill(''));
+      pendingQueue.splice(i, 1);
+    }
+  }
+
+  // 再中断已发出的 fetch；其 finally 会归还并发槽并继续处理队列。
+  const controllers = activeControllersByTab.get(tabId);
+  if (controllers) {
+    for (const controller of controllers) controller.abort();
+    activeControllersByTab.delete(tabId);
   }
 }
 
@@ -278,7 +366,7 @@ async function processTask(task) {
     const results = new Array(resultLength).fill('');
 
     texts.forEach((text, i) => {
-      const cacheKey = getCacheKey(text, targetLang);
+      const cacheKey = getCacheKey(text, targetLang, model);
       const cached = translationCache.get(cacheKey);
       if (cached !== undefined) {
         results[indexMap[i]] = cached;
@@ -289,13 +377,13 @@ async function processTask(task) {
     });
 
     if (uncachedTexts.length > 0) {
-      const translated = await translateWithRetry(uncachedTexts, targetLang, apiKey, model);
+      const translated = await translateWithRetry(uncachedTexts, targetLang, apiKey, model, tabId);
 
       translated.forEach((trans, j) => {
         const originalIndex = uncachedIndices[j];
         const originalText = uncachedTexts[j];
         results[originalIndex] = trans;
-        const cacheKey = getCacheKey(originalText, targetLang);
+        const cacheKey = getCacheKey(originalText, targetLang, model);
         addToCache(cacheKey, trans);
       });
     }
@@ -303,6 +391,10 @@ async function processTask(task) {
     // 队列清空时立即持久化缓存（service worker 随时可能被回收，30s 防抖会丢失尾巴）
     resolve(results);
   } catch (err) {
+    if (err.name === 'CancelledError') {
+      resolve(new Array(resultLength).fill(''));
+      return;
+    }
     reject(err);
   }
 }
@@ -331,6 +423,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     translationCache.clear();
     cacheDirty = true;
     persistCache();
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (message.type === 'CANCEL_TRANSLATIONS') {
+    cancelTabRequests(sender.tab?.id);
     sendResponse({ success: true });
     return false;
   }
@@ -369,7 +467,7 @@ async function handleTranslateTexts(message, sender) {
       resultLength: texts.length,
       targetLang: targetLang || 'zh-CN',
       apiKey,
-      model: model || 'deepseek-v4-flash',
+      model: model || 'deepseek-flash',
       resolve: (results) => resolve({ translations: results }),
       reject: (err) => reject(err),
       tabId: sender.tab?.id,
@@ -385,7 +483,7 @@ async function handleTranslateTexts(message, sender) {
 const DEFAULT_SETTINGS = {
   apiKey: '',
   targetLang: 'zh-CN',
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-flash',
   translationStyle: 'below',
   fontSize: '0.92em',
   autoTranslate: false,
@@ -395,8 +493,10 @@ const DEFAULT_SETTINGS = {
 
 // 旧模型名迁移映射
 const MODEL_MIGRATION = {
-  'deepseek-chat': 'deepseek-v4-flash',
+  'deepseek-chat': 'deepseek-flash',
   'deepseek-reasoner': 'deepseek-v4-pro',
+  'deepseek-v4-flash': 'deepseek-flash',
+  'deepseek-v4-flash-vision-exp': 'deepseek-flash',
 };
 
 async function getSettings() {
@@ -435,10 +535,5 @@ chrome.commands?.onCommand?.addListener((command, tab) => {
 // ============================================================
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  for (let i = pendingQueue.length - 1; i >= 0; i--) {
-    if (pendingQueue[i].tabId === tabId) {
-      pendingQueue[i].resolve([]);
-      pendingQueue.splice(i, 1);
-    }
-  }
+  cancelTabRequests(tabId);
 });

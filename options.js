@@ -51,7 +51,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function populateForm() {
     apiKeyInput.value = currentSettings.apiKey || '';
     targetLangSelect.value = currentSettings.targetLang || 'zh-CN';
-    modelSelect.value = currentSettings.model || 'deepseek-v4-flash';
+    modelSelect.value = currentSettings.model || 'deepseek-flash';
     autoTranslateToggle.checked = currentSettings.autoTranslate || false;
 
     const styleRadio = document.querySelector(

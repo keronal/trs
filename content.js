@@ -30,6 +30,7 @@
   const registry = new Map();
   const queue = [];            // 待翻译 entry 引用数组（唯一文本）
   let inFlight = 0;
+  let fullScanWalker = null;
 
   const BATCH_SIZE = 8;
   const VISIBLE_BATCH_SIZE = 4;      // 视口附近用小批次，缩短首批译文等待时间
@@ -89,7 +90,6 @@
       // 使用默认设置
       settings = {
         targetLang: 'zh-CN',
-        translationStyle: 'below',
         fontSize: '0.92em',
       };
     }
@@ -103,9 +103,6 @@
     if (settings.autoTranslate) {
       startTranslation();
     }
-
-    // 设置 DOM 监听
-    setupMutationObserver();
 
     // 滚动监听：静态长页面滚入未翻译区域时补充收集
     setupScrollListener();
@@ -198,7 +195,7 @@
     // 检查排除域名
     if (isDomainExcluded()) return;
 
-    if (!settings.apiKey) {
+    if (!settings.hasApiKey) {
       console.warn('[TRS] 未配置 API Key，请右键扩展图标 → 选项 进行配置');
       return;
     }
@@ -208,7 +205,7 @@
     inFlight = 0;
     registry.clear();
     queue.length = 0;
-    document.body.classList.add('trs-active');
+    fullScanWalker = null;
     showToast('🌐 翻译已开启', 'on');
 
     // 开启 DOM 变化监听
@@ -227,6 +224,7 @@
     inFlight = 0;
     registry.clear();
     queue.length = 0;
+    fullScanWalker = null;
     removeAllTranslations();
     await cancelTranslationRequests();
     if (myRunId !== runId) return;
@@ -244,6 +242,7 @@
     inFlight = 0;
     registry.clear();
     queue.length = 0;
+    fullScanWalker = null;
 
     // 断开 DOM 监听，避免翻译关闭后仍持续消耗资源
     if (observer) {
@@ -273,7 +272,6 @@
     const translations = document.querySelectorAll('.trs-translation');
     translations.forEach(el => el.remove());
     translatedElements = new WeakMap();
-    document.body.classList.remove('trs-active');
   }
 
   function updateTranslationStyles() {
@@ -444,7 +442,6 @@
         type: 'TRANSLATE_TEXTS',
         texts,
         targetLang: settings.targetLang,
-        apiKey: settings.apiKey,
         model: settings.model,
       });
 
@@ -561,7 +558,6 @@
     const candidates = [];
     const touchedDone = new Set();
 
-    const elements = root.querySelectorAll(BLOCK_SELECTORS);
     const rootIsCandidate = root.nodeType === Node.ELEMENT_NODE &&
       root.matches && root.matches(BLOCK_SELECTORS);
 
@@ -572,7 +568,16 @@
 
     function* matchingElements() {
       if (rootIsCandidate) yield root;
-      yield* elements;
+      const isFullScan = root === document.body;
+      if (isFullScan && fullScanWalker?.root !== root) fullScanWalker = null;
+      const walker = isFullScan
+        ? (fullScanWalker ||= document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT))
+        : document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      let el;
+      while ((el = walker.nextNode())) {
+        if (el.matches?.(BLOCK_SELECTORS)) yield el;
+      }
+      if (isFullScan) fullScanWalker = null;
     }
 
     const candidateSet = new Set();
@@ -741,17 +746,18 @@
     return found;
   }
 
-  /**
-   * 登记表瘦身：条目过多时清理所有元素都已脱离 DOM 的条目。
-   */
+  /** 登记表瘦身：清理脱离 DOM 的节点，并淘汰已完成或未排队条目以守住上限。 */
   function pruneRegistry() {
     if (registry.size < REGISTRY_MAX) return;
     for (const [key, entry] of registry) {
-      let anyConnected = false;
       for (const el of entry.elements) {
-        if (el.isConnected) { anyConnected = true; break; }
+        if (!el.isConnected) entry.elements.delete(el);
       }
-      if (!anyConnected) registry.delete(key);
+      if (entry.elements.size === 0 && !entry.queued && !entry.inFlight) registry.delete(key);
+    }
+    for (const [key, entry] of registry) {
+      if (registry.size <= REGISTRY_MAX) break;
+      if (entry.done || (!entry.queued && !entry.inFlight)) registry.delete(key);
     }
   }
 

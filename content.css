@@ -7,6 +7,7 @@
 /* ---- 译文默认：行内显示，纯文字弱化，无边框无背景 ---- */
 .trs-translation {
   display: inline !important;
+  overflow-anchor: none !important;
   margin: 0 0 0 8px !important;
   padding: 0 !important;
   border: none !important;

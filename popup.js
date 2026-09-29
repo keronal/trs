@@ -69,7 +69,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function checkApiKey() {
-    if (!settings.apiKey) {
+    if (!settings.hasApiKey) {
       apiWarning.style.display = 'flex';
     } else {
       apiWarning.style.display = 'none';
@@ -138,7 +138,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 主按钮：翻译/关闭
   btnTranslate.addEventListener('click', async () => {
-    if (!settings.apiKey) {
+    if (!settings.hasApiKey) {
       apiWarning.style.display = 'flex';
       apiWarning.style.animation = 'none';
       apiWarning.offsetHeight;
@@ -158,8 +158,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         type: 'UPDATE_SETTINGS',
         settings: {
           targetLang: targetLang.value,
-          translationStyle: 'below',
-          apiKey: settings.apiKey,
         },
       });
       await sendToTab(tab.id, { type: 'START_TRANSLATION' });
@@ -190,7 +188,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) return;
 
-    if (!settings.apiKey) {
+    if (!settings.hasApiKey) {
       apiWarning.style.display = 'flex';
       return;
     }
@@ -199,8 +197,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       type: 'UPDATE_SETTINGS',
       settings: {
         targetLang: targetLang.value,
-        translationStyle: 'below',
-        apiKey: settings.apiKey,
       },
     });
     await sendToTab(tab.id, { type: 'RETRANSLATE_PAGE' });

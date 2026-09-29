@@ -3,7 +3,20 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 
-async function loadBackground(fetchImpl, syncValues = {}) {
+function readStorage(values, keys) {
+  if (keys == null) return { ...values };
+  if (typeof keys === 'string') return { [keys]: values[keys] };
+  if (Array.isArray(keys)) {
+    return Object.fromEntries(keys.filter(key => key in values).map(key => [key, values[key]]));
+  }
+  return { ...keys, ...values };
+}
+
+function removeStorage(values, keys) {
+  for (const key of Array.isArray(keys) ? keys : [keys]) delete values[key];
+}
+
+async function loadBackground(fetchImpl, syncValues = {}, localValues = {}) {
   const source = await readFile(new URL('../background.js', import.meta.url), 'utf8');
   const context = vm.createContext({
     AbortController,
@@ -14,16 +27,20 @@ async function loadBackground(fetchImpl, syncValues = {}) {
     chrome: {
       storage: {
         sync: {
-          get: async defaults => ({ ...defaults, ...syncValues }),
+          get: async keys => readStorage(syncValues, keys),
           set: async values => Object.assign(syncValues, values),
+          remove: async keys => removeStorage(syncValues, keys),
+          setAccessLevel: async () => {},
         },
         local: {
-          get: async () => ({}),
-          set: async () => {},
+          get: async keys => readStorage(localValues, keys),
+          set: async values => Object.assign(localValues, values),
+          setAccessLevel: async () => {},
         },
         onChanged: { addListener: () => {} },
       },
       runtime: {
+        id: 'test-extension',
         onMessage: { addListener: () => {} },
         onInstalled: { addListener: () => {} },
       },
@@ -36,6 +53,8 @@ async function loadBackground(fetchImpl, syncValues = {}) {
     },
   });
   vm.runInContext(source, context, { filename: 'background.js' });
+  context.__syncValues = syncValues;
+  context.__localValues = localValues;
   return context;
 }
 
@@ -82,6 +101,60 @@ test('translation cache is isolated by model', async () => {
   );
 
   assert.notEqual(flashKey, proKey);
+});
+
+test('empty translations are not cached', async () => {
+  const localValues = { translationCache: [['old-empty', '']] };
+  const context = await loadBackground(async () => {}, {}, localValues);
+  await vm.runInContext('initPromise', context);
+
+  const cached = vm.runInContext(
+    `addToCache('empty', ''); translationCache.has('empty') || translationCache.has('old-empty')`,
+    context,
+  );
+
+  assert.equal(cached, false);
+});
+
+test('legacy API key moves to local storage and is hidden from settings', async () => {
+  const syncValues = { apiKey: 'legacy-key' };
+  const localValues = {};
+  const context = await loadBackground(async () => {}, syncValues, localValues);
+
+  const settings = await vm.runInContext('getSettings()', context);
+
+  assert.equal(settings.hasApiKey, true);
+  assert.equal('apiKey' in settings, false);
+  assert.equal(localValues.apiKey, 'legacy-key');
+  assert.equal('apiKey' in syncValues, false);
+});
+
+test('translation uses the local API key and keeps long text intact', async () => {
+  let request;
+  const localValues = { apiKey: 'local-key' };
+  const context = await loadBackground(async (_url, options) => {
+    request = { options, body: JSON.parse(options.body) };
+    return {
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '[0] 完整译文' } }] }),
+    };
+  }, {}, localValues);
+  const text = 'x'.repeat(2500);
+  context.__longText = text;
+
+  const response = await vm.runInContext(
+    `handleTranslateTexts({
+      texts: [__longText],
+      targetLang: 'zh-CN',
+      model: 'deepseek-flash',
+      apiKey: 'untrusted-key'
+    }, { tab: { id: 7 } })`,
+    context,
+  );
+
+  assert.equal(request.options.headers.Authorization, 'Bearer local-key');
+  assert.equal(request.body.messages[1].content, `[0] ${text}`);
+  assert.deepEqual([...response.translations], ['完整译文']);
 });
 
 test('cancelling a tab aborts its in-flight request without retrying', async () => {

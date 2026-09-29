@@ -4,9 +4,7 @@
   "version": "1.2.0",
   "description": "基于 DeepSeek AI 的网页双语翻译扩展，原文译文对照显示，流畅不卡顿。",
   "permissions": [
-    "storage",
-    "activeTab",
-    "scripting"
+    "storage"
   ],
   "host_permissions": [
     "https://api.deepseek.com/*"
@@ -48,11 +46,5 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
-  },
-  "web_accessible_resources": [
-    {
-      "resources": ["content.css"],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  }
 }

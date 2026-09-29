@@ -14,8 +14,10 @@ const REQUEST_TIMEOUT = 45000;
 const translationCache = new Map();
 const CACHE_MAX_SIZE = 4000;
 const CACHE_STORAGE_KEY = 'translationCache';
+const API_KEY_STORAGE_KEY = 'apiKey';
 let cacheDirty = false;
 let cacheSaveTimer = null;
+let apiKey = '';
 
 // 请求队列管理
 let activeRequests = 0;
@@ -25,7 +27,23 @@ const pendingQueue = [];
 const activeControllersByTab = new Map();
 
 // 初始化时加载设置 + 恢复持久化缓存
-(async function init() {
+const initPromise = (async function init() {
+  await Promise.allSettled([
+    chrome.storage.local.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' }),
+    chrome.storage.sync.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' }),
+  ]);
+
+  // 旧版本把 API Key 放在 sync 中；迁移到仅本机保存的 local，并清理废弃设置。
+  const [legacy, local] = await Promise.all([
+    chrome.storage.sync.get([API_KEY_STORAGE_KEY, 'translationStyle']),
+    chrome.storage.local.get(API_KEY_STORAGE_KEY),
+  ]);
+  apiKey = local[API_KEY_STORAGE_KEY] || legacy[API_KEY_STORAGE_KEY] || '';
+  if (!local[API_KEY_STORAGE_KEY] && apiKey) {
+    await chrome.storage.local.set({ [API_KEY_STORAGE_KEY]: apiKey });
+  }
+  await chrome.storage.sync.remove([API_KEY_STORAGE_KEY, 'translationStyle']);
+
   const result = await chrome.storage.sync.get({ maxConcurrent: DEFAULT_MAX_CONCURRENT });
   maxConcurrent = result.maxConcurrent || DEFAULT_MAX_CONCURRENT;
 
@@ -34,7 +52,7 @@ const activeControllersByTab = new Map();
     const stored = await chrome.storage.local.get(CACHE_STORAGE_KEY);
     if (stored[CACHE_STORAGE_KEY] && Array.isArray(stored[CACHE_STORAGE_KEY])) {
       for (const [key, value] of stored[CACHE_STORAGE_KEY]) {
-        if (translationCache.size < CACHE_MAX_SIZE) {
+        if (value && value.trim() && translationCache.size < CACHE_MAX_SIZE) {
           translationCache.set(key, value);
         }
       }
@@ -51,6 +69,7 @@ function markCacheDirty() {
 }
 
 async function persistCache() {
+  if (cacheSaveTimer) clearTimeout(cacheSaveTimer);
   cacheSaveTimer = null;
   if (!cacheDirty) return;
   cacheDirty = false;
@@ -67,6 +86,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
     maxConcurrent = changes.maxConcurrent.newValue || DEFAULT_MAX_CONCURRENT;
     // 设置变更后尝试处理更多队列任务
     processQueue();
+  }
+  if (area === 'local' && changes[API_KEY_STORAGE_KEY]) {
+    apiKey = changes[API_KEY_STORAGE_KEY].newValue || '';
   }
 });
 
@@ -89,6 +111,7 @@ function getCacheKey(text, targetLang, model) {
 }
 
 function addToCache(key, translation) {
+  if (!translation || !translation.trim()) return;
   if (translationCache.size >= CACHE_MAX_SIZE) {
     // 删除最旧的 20% 条目
     const keysToDelete = Math.floor(CACHE_MAX_SIZE * 0.2);
@@ -346,7 +369,7 @@ async function processQueue() {
 }
 
 async function processTask(task) {
-  const { texts, indexMap, resultLength, targetLang, apiKey, model, resolve, reject, tabId } = task;
+  const { texts, indexMap, resultLength, targetLang, model, resolve, reject, tabId } = task;
 
   // 检查标签页是否仍然存在，避免为已关闭的页面浪费 API 调用
   if (tabId != null) {
@@ -419,6 +442,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'GET_API_KEY') {
+    if (sender.tab) {
+      sendResponse({ error: '无权读取 API Key' });
+      return false;
+    }
+    initPromise
+      .then(() => sendResponse({ apiKey }))
+      .catch(err => sendResponse({ error: err.message }));
+    return true;
+  }
+
+  if (message.type === 'SET_API_KEY') {
+    if (sender.tab) {
+      sendResponse({ error: '无权修改 API Key' });
+      return false;
+    }
+    initPromise
+      .then(() => {
+        const nextKey = typeof message.apiKey === 'string' ? message.apiKey.trim() : '';
+        return chrome.storage.local.set({ [API_KEY_STORAGE_KEY]: nextKey })
+          .then(() => { apiKey = nextKey; });
+      })
+      .then(() => sendResponse({ success: true }))
+      .catch(err => sendResponse({ error: err.message }));
+    return true;
+  }
+
   if (message.type === 'CLEAR_CACHE') {
     translationCache.clear();
     cacheDirty = true;
@@ -435,7 +485,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleTranslateTexts(message, sender) {
-  const { texts, targetLang, apiKey, model } = message;
+  await initPromise;
+  const { texts, targetLang, model } = message;
 
   if (!texts || !texts.length) {
     return { translations: [] };
@@ -445,13 +496,13 @@ async function handleTranslateTexts(message, sender) {
     return { error: '请先在设置中配置 DeepSeek API Key' };
   }
 
-  // 过滤空文本和过长文本（空文本不发送，减少 token 与响应延迟）
+  // 过滤空文本；保留完整原文，避免静默截断后显示残缺译文。
   const items = [];
   texts.forEach((t, i) => {
     const trimmed = (t || '').trim();
     if (!trimmed) return;
     items.push({
-      text: trimmed.length > 2000 ? trimmed.substring(0, 2000) : trimmed,
+      text: trimmed,
       index: i,
     });
   });
@@ -466,7 +517,6 @@ async function handleTranslateTexts(message, sender) {
       indexMap: items.map(x => x.index),
       resultLength: texts.length,
       targetLang: targetLang || 'zh-CN',
-      apiKey,
       model: model || 'deepseek-flash',
       resolve: (results) => resolve({ translations: results }),
       reject: (err) => reject(err),
@@ -481,10 +531,8 @@ async function handleTranslateTexts(message, sender) {
 // ============================================================
 
 const DEFAULT_SETTINGS = {
-  apiKey: '',
   targetLang: 'zh-CN',
   model: 'deepseek-flash',
-  translationStyle: 'below',
   fontSize: '0.92em',
   autoTranslate: false,
   maxConcurrent: 8,
@@ -500,8 +548,9 @@ const MODEL_MIGRATION = {
 };
 
 async function getSettings() {
+  await initPromise;
   const result = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-  const settings = { ...DEFAULT_SETTINGS, ...result };
+  const settings = { ...DEFAULT_SETTINGS, ...result, hasApiKey: Boolean(apiKey) };
   // 迁移旧模型名
   if (MODEL_MIGRATION[settings.model]) {
     settings.model = MODEL_MIGRATION[settings.model];
@@ -512,6 +561,7 @@ async function getSettings() {
 
 // 初始化：确保默认设置存在，迁移旧模型名
 chrome.runtime.onInstalled.addListener(async () => {
+  await initPromise;
   const current = await chrome.storage.sync.get(DEFAULT_SETTINGS);
   const merged = { ...DEFAULT_SETTINGS, ...current };
   if (MODEL_MIGRATION[merged.model]) {

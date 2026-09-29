@@ -12,7 +12,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const targetLangSelect = document.getElementById('targetLang');
   const modelSelect = document.getElementById('model');
   const autoTranslateToggle = document.getElementById('autoTranslate');
-  const translationStyleRadios = document.querySelectorAll('input[name="translationStyle"]');
   const fontSizeSelect = document.getElementById('fontSize');
   const maxConcurrentSelect = document.getElementById('maxConcurrent');
   const excludedDomainsTextarea = document.getElementById('excludedDomains');
@@ -39,11 +38,16 @@ document.addEventListener('DOMContentLoaded', () => {
       const response = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
       if (!response.error) {
         currentSettings = response;
+        const keyResponse = await chrome.runtime.sendMessage({ type: 'GET_API_KEY' });
+        currentSettings.apiKey = keyResponse.apiKey || '';
       }
     } catch (e) {
       // background 不可用时回退到直接读取 storage
-      const stored = await chrome.storage.sync.get(null);
-      currentSettings = stored || {};
+      const [stored, local] = await Promise.all([
+        chrome.storage.sync.get(null),
+        chrome.storage.local.get('apiKey'),
+      ]);
+      currentSettings = { ...stored, apiKey: local.apiKey || '' };
     }
     populateForm();
   }
@@ -53,11 +57,6 @@ document.addEventListener('DOMContentLoaded', () => {
     targetLangSelect.value = currentSettings.targetLang || 'zh-CN';
     modelSelect.value = currentSettings.model || 'deepseek-flash';
     autoTranslateToggle.checked = currentSettings.autoTranslate || false;
-
-    const styleRadio = document.querySelector(
-      `input[name="translationStyle"][value="${currentSettings.translationStyle}"]`
-    );
-    if (styleRadio) styleRadio.checked = true;
 
     fontSizeSelect.value = currentSettings.fontSize || '0.92em';
     maxConcurrentSelect.value = String(currentSettings.maxConcurrent || 8);
@@ -74,18 +73,26 @@ document.addEventListener('DOMContentLoaded', () => {
   // 保存设置
   // ============================================================
   async function saveSettings(partial) {
-    Object.assign(currentSettings, partial);
-    await chrome.storage.sync.set(partial);
-    showToast('设置已保存 ✓', 'success');
-
-    // 通知所有标签页更新设置
-    notifyAllTabs(partial);
+    try {
+      if (Object.hasOwn(partial, 'apiKey')) {
+        const response = await chrome.runtime.sendMessage({ type: 'SET_API_KEY', apiKey: partial.apiKey });
+        if (response?.error) throw new Error(response.error);
+      } else {
+        await chrome.storage.sync.set(partial);
+      }
+      Object.assign(currentSettings, partial);
+      showToast('设置已保存 ✓', 'success');
+      notifyAllTabs(partial);
+    } catch (e) {
+      showToast('设置保存失败，请重试', 'error');
+    }
   }
 
   async function notifyAllTabs(partialSettings) {
     try {
       const { apiKey, ...safeSettings } = partialSettings;
-      const tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+      if (apiKey !== undefined) safeSettings.hasApiKey = Boolean(apiKey);
+      const tabs = await chrome.tabs.query({});
       for (const tab of tabs) {
         if (tab.id) {
           chrome.tabs.sendMessage(tab.id, {
@@ -138,15 +145,6 @@ document.addEventListener('DOMContentLoaded', () => {
   // 自动翻译
   autoTranslateToggle.addEventListener('change', () => {
     saveSettings({ autoTranslate: autoTranslateToggle.checked });
-  });
-
-  // 翻译样式
-  translationStyleRadios.forEach(radio => {
-    radio.addEventListener('change', () => {
-      if (radio.checked) {
-        saveSettings({ translationStyle: radio.value });
-      }
-    });
   });
 
   // 译文字号

@@ -39,6 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!response.error) {
         currentSettings = response;
         const keyResponse = await chrome.runtime.sendMessage({ type: 'GET_API_KEY' });
+        if (keyResponse.error) throw new Error(keyResponse.error);
         currentSettings.apiKey = keyResponse.apiKey || '';
       }
     } catch (e) {
@@ -172,8 +173,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 清除缓存
   clearCacheBtn.addEventListener('click', async () => {
-    await chrome.runtime.sendMessage({ type: 'CLEAR_CACHE' });
-    showToast('翻译缓存已清除 ✓', 'success');
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'CLEAR_CACHE' });
+      if (response?.error) throw new Error(response.error);
+      showToast('翻译缓存已清除 ✓', 'success');
+    } catch (e) {
+      showToast('清除缓存失败，请重试', 'error');
+    }
   });
 
   // ============================================================

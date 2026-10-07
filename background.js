@@ -10,7 +10,7 @@ const MAX_RETRIES = 2;
 // 45s 足够覆盖正常慢请求，同时避免挂死槽位过久
 const REQUEST_TIMEOUT = 45000;
 
-// 翻译缓存：key = `${lang}:${text}`, value = translated text
+// 翻译缓存：模型、目标语言与完整原文共同组成键。
 const translationCache = new Map();
 const CACHE_MAX_SIZE = 4000;
 const CACHE_STORAGE_KEY = 'translationCache';
@@ -52,7 +52,7 @@ const initPromise = (async function init() {
     const stored = await chrome.storage.local.get(CACHE_STORAGE_KEY);
     if (stored[CACHE_STORAGE_KEY] && Array.isArray(stored[CACHE_STORAGE_KEY])) {
       for (const [key, value] of stored[CACHE_STORAGE_KEY]) {
-        if (value && value.trim() && translationCache.size < CACHE_MAX_SIZE) {
+        if (typeof key === 'string' && key.startsWith('[') && typeof value === 'string' && value.trim() && translationCache.size < CACHE_MAX_SIZE) {
           translationCache.set(key, value);
         }
       }
@@ -75,9 +75,22 @@ async function persistCache() {
   cacheDirty = false;
   try {
     const entries = Array.from(translationCache.entries());
-    const toSave = entries.slice(-CACHE_MAX_SIZE);
-    await chrome.storage.local.set({ [CACHE_STORAGE_KEY]: toSave });
-  } catch (e) { /* 静默忽略 */ }
+    const toSave = [];
+    let characters = 0;
+    // 完整原文作为键后按存储体积淘汰，留出 local storage 配额余量。
+    for (const entry of entries.reverse()) {
+      const size = JSON.stringify(entry).length;
+      if (toSave.length >= CACHE_MAX_SIZE || characters + size > 1500000) {
+        translationCache.delete(entry[0]);
+        continue;
+      }
+      characters += size;
+      toSave.push(entry);
+    }
+    await chrome.storage.local.set({ [CACHE_STORAGE_KEY]: toSave.reverse() });
+  } catch (e) {
+    cacheDirty = true;
+  }
 }
 
 // 监听设置变更
@@ -96,18 +109,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // 工具函数
 // ============================================================
 
-function hashText(text) {
-  let hash = 0;
-  for (let i = 0; i < text.length; i++) {
-    const char = text.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash |= 0;
-  }
-  return hash.toString(36);
-}
-
 function getCacheKey(text, targetLang, model) {
-  return `${model || 'deepseek-flash'}:${targetLang}:${hashText(text)}`;
+  return JSON.stringify([model || 'deepseek-flash', targetLang, text]);
 }
 
 function addToCache(key, translation) {
@@ -160,20 +163,29 @@ async function callDeepSeekAPI(texts, targetLang, apiKey, model, controller) {
       signal: controller.signal,
     });
 
-    clearTimeout(timeoutId);
-
     if (!response.ok) {
-      const errorBody = await response.text().catch(() => '');
-      throw new Error(`API error ${response.status}: ${errorBody}`);
+      const error = new Error({
+        401: 'API Key 无效，请在设置中检查密钥',
+        402: 'API 余额不足，请充值后重试',
+        403: 'API 访问被拒绝，请检查账户权限',
+        429: '请求过于频繁，请稍后重试或降低并发数',
+      }[response.status] || `翻译服务错误（${response.status}）`);
+      error.retryable = response.status === 429 || response.status >= 500;
+      throw error;
     }
 
     const data = await response.json();
     const rawOutput = data.choices?.[0]?.message?.content || '';
 
     // 解析返回的翻译结果
-    return parseBatchResult(rawOutput, texts.length);
+    const results = parseBatchResult(rawOutput, texts.length);
+    if (data.choices?.[0]?.finish_reason === 'length') {
+      // 截断时最后一段可能只有半句，不能显示或缓存。
+      const indices = [...rawOutput.matchAll(/^\s*\[(\d+)\]/gm)].map(match => Number(match[1]));
+      if (indices.length) results[indices.at(-1)] = '';
+    }
+    return results;
   } catch (err) {
-    clearTimeout(timeoutId);
     if (err.name === 'AbortError' && !timedOut) {
       const cancelled = new Error('翻译请求已取消');
       cancelled.name = 'CancelledError';
@@ -183,6 +195,8 @@ async function callDeepSeekAPI(texts, targetLang, apiKey, model, controller) {
       throw new Error('翻译请求超时，请检查网络或稍后重试');
     }
     throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -225,27 +239,13 @@ function getSystemPrompt(targetLang) {
 
 function parseBatchResult(rawOutput, expectedCount) {
   const results = new Array(expectedCount).fill('');
-  const lines = rawOutput.split('\n');
-
-  for (const line of lines) {
-    const match = line.match(/^\[(\d+)\]\s*(.+)/);
-    if (match) {
-      const index = parseInt(match[1], 10);
-      if (index >= 0 && index < expectedCount) {
-        results[index] = match[2].trim();
-      }
-    }
-  }
-
-  // 对于没有匹配到的，尝试回退解析
-  for (let i = 0; i < expectedCount; i++) {
-    if (!results[i]) {
-      // 尝试直接查找包含该序号的行
-      const fallbackMatch = rawOutput.match(new RegExp(`\\[${i}\\][^\\[]*`, 's'));
-      if (fallbackMatch) {
-        const text = fallbackMatch[0].replace(/^\[\d+\]\s*/, '').trim();
-        if (text) results[i] = text;
-      }
+  const markers = [...rawOutput.matchAll(/^\s*\[(\d+)\][ \t]*/gm)];
+  for (let i = 0; i < markers.length; i++) {
+    const marker = markers[i];
+    const index = Number(marker[1]);
+    if (index < expectedCount) {
+      results[index] = rawOutput.slice(marker.index + marker[0].length,
+        markers[i + 1]?.index ?? rawOutput.length).trim();
     }
   }
 
@@ -316,7 +316,7 @@ async function translateWithRetry(texts, targetLang, apiKey, model, tabId, retri
         if (cancelController.signal.aborted || err.name === 'CancelledError') {
           throw createCancelledError();
         }
-        if (attempt >= retries) throw err;
+        if (err.retryable === false || attempt >= retries) throw err;
       } finally {
         cancelController.signal.removeEventListener('abort', cancelRequest);
       }
@@ -326,6 +326,44 @@ async function translateWithRetry(texts, targetLang, apiKey, model, tabId, retri
   } finally {
     untrackController(tabId, cancelController);
   }
+}
+
+// ponytail: 用字符数近似控制批量长度；极端扩译由截断检查兜底，需精确预算时再加 tokenizer。
+// 完整拼回后才缓存。
+async function translateComplete(texts, targetLang, key, model, tabId) {
+  const parts = texts.flatMap((text, index) => {
+    const chunks = [];
+    for (let offset = 0; offset < text.length;) {
+      let end = Math.min(offset + 1200, text.length);
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+      chunks.push({ index, text: text.slice(offset, end) });
+      offset = end;
+    }
+    return chunks;
+  });
+  const results = texts.map(() => []);
+  for (let offset = 0; offset < parts.length;) {
+    const batch = [];
+    let size = 0;
+    while (offset < parts.length && size + parts[offset].text.length <= 2400) {
+      const part = parts[offset++];
+      size += part.text.length;
+      batch.push(part);
+    }
+    const translated = await translateWithRetry(batch.map(part => part.text), targetLang, key, model, tabId);
+    const missing = batch.map((_, i) => i).filter(i => !translated[i]);
+    if (missing.length) {
+      const supplement = await translateWithRetry(missing.map(i => batch[i].text), targetLang, key, model, tabId);
+      missing.forEach((index, i) => { translated[index] = supplement[i]; });
+    }
+    if (translated.some(text => !text)) {
+      const error = new Error('部分译文不完整，请重试或换用另一翻译模型');
+      error.retryable = false;
+      throw error;
+    }
+    batch.forEach((part, i) => results[part.index].push(translated[i]));
+  }
+  return results.map(parts => parts.join('\n'));
 }
 
 function cancelTabRequests(tabId) {
@@ -369,7 +407,7 @@ async function processQueue() {
 }
 
 async function processTask(task) {
-  const { texts, indexMap, resultLength, targetLang, model, resolve, reject, tabId } = task;
+  const { texts, indexMap, resultLength, targetLang, model, resolve, reject, tabId, bypassCache } = task;
 
   // 检查标签页是否仍然存在，避免为已关闭的页面浪费 API 调用
   if (tabId != null) {
@@ -390,7 +428,7 @@ async function processTask(task) {
 
     texts.forEach((text, i) => {
       const cacheKey = getCacheKey(text, targetLang, model);
-      const cached = translationCache.get(cacheKey);
+      const cached = bypassCache ? undefined : translationCache.get(cacheKey);
       if (cached !== undefined) {
         results[indexMap[i]] = cached;
       } else {
@@ -400,7 +438,7 @@ async function processTask(task) {
     });
 
     if (uncachedTexts.length > 0) {
-      const translated = await translateWithRetry(uncachedTexts, targetLang, apiKey, model, tabId);
+      const translated = await translateComplete(uncachedTexts, targetLang, apiKey, model, tabId);
 
       translated.forEach((trans, j) => {
         const originalIndex = uncachedIndices[j];
@@ -426,11 +464,16 @@ async function processTask(task) {
 // 消息处理
 // ============================================================
 
+function isTrustedExtensionPage(sender) {
+  return sender.id === chrome.runtime.id &&
+    sender.url?.startsWith(`chrome-extension://${chrome.runtime.id}/`);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'TRANSLATE_TEXTS') {
     handleTranslateTexts(message, sender).then(sendResponse).catch(err => {
       console.error('[TRS Background] API error:', err.message);
-      sendResponse({ error: '翻译服务暂时不可用，请稍后重试' });
+      sendResponse({ error: err.message, retryable: false });
     });
     return true; // 异步响应
   }
@@ -443,7 +486,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'GET_API_KEY') {
-    if (sender.tab) {
+    if (!isTrustedExtensionPage(sender)) {
       sendResponse({ error: '无权读取 API Key' });
       return false;
     }
@@ -454,7 +497,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'SET_API_KEY') {
-    if (sender.tab) {
+    if (!isTrustedExtensionPage(sender)) {
       sendResponse({ error: '无权修改 API Key' });
       return false;
     }
@@ -470,11 +513,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'CLEAR_CACHE') {
-    translationCache.clear();
-    cacheDirty = true;
-    persistCache();
-    sendResponse({ success: true });
-    return false;
+    initPromise.then(async () => {
+      translationCache.clear();
+      cacheDirty = true;
+      await persistCache();
+      if (cacheDirty) throw new Error('清除缓存失败，请重试');
+      sendResponse({ success: true });
+    }).catch(err => sendResponse({ error: err.message }));
+    return true;
   }
 
   if (message.type === 'CANCEL_TRANSLATIONS') {
@@ -487,13 +533,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleTranslateTexts(message, sender) {
   await initPromise;
   const { texts, targetLang, model } = message;
+  if (!Array.isArray(texts) || texts.length > 300 || texts.some(text => typeof text !== 'string' || text.length > 100000)) {
+    return { error: '翻译文本格式或长度不合法', retryable: false };
+  }
 
   if (!texts || !texts.length) {
     return { translations: [] };
   }
 
   if (!apiKey) {
-    return { error: '请先在设置中配置 DeepSeek API Key' };
+    return { error: '请先在设置中配置 DeepSeek API Key', retryable: false };
   }
 
   // 过滤空文本；保留完整原文，避免静默截断后显示残缺译文。
@@ -521,6 +570,7 @@ async function handleTranslateTexts(message, sender) {
       resolve: (results) => resolve({ translations: results }),
       reject: (err) => reject(err),
       tabId: sender.tab?.id,
+      bypassCache: message.bypassCache === true,
     });
     processQueue();
   });

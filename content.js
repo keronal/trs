@@ -20,6 +20,8 @@
   let isActive = false;
   let runId = 0;               // 每次 start/stop 递增，使在途结果失效
   let settings = {};
+  let lastError = '';
+  let bypassCache = false;
   let observer = null;
   // 已翻译元素及其翻译时的原文快照：element -> originalText
   // 收集时若元素当前文本与快照不一致（如 X 的 "Show more" 展开），则取消标记并重新翻译
@@ -94,13 +96,8 @@
       };
     }
 
-    // 检查当前域名是否在排除列表中
-    if (isDomainExcluded()) {
-      return;
-    }
-
     // 检查是否应自动翻译
-    if (settings.autoTranslate) {
+    if (settings.autoTranslate && !isDomainExcluded()) {
       startTranslation();
     }
 
@@ -140,9 +137,8 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case 'START_TRANSLATION':
-        startTranslation();
-        sendResponse({ success: true });
-        break;
+        startTranslation().then(() => sendResponse({ success: isActive, isActive, error: lastError }));
+        return true;
 
       case 'STOP_TRANSLATION':
         stopTranslation().then(() => sendResponse({ success: true }));
@@ -155,12 +151,12 @@
           } else {
             await startTranslation();
           }
-          sendResponse({ success: true, isActive });
+          sendResponse({ success: isActive || !lastError, isActive, error: lastError });
         })();
         return true;
 
       case 'GET_STATUS':
-        sendResponse({ isActive, isTranslating: getIsTranslating() });
+        sendResponse({ isActive, isTranslating: getIsTranslating(), error: lastError });
         break;
 
       case 'REMOVE_ALL_TRANSLATIONS':
@@ -168,16 +164,25 @@
         return true;
 
       case 'RETRANSLATE_PAGE':
-        retranslatePage().then(() => sendResponse({ success: true }));
+        retranslatePage(true).then(() => sendResponse({ success: isActive, isActive, error: lastError }));
         return true;
 
-      case 'UPDATE_SETTINGS':
+      case 'UPDATE_SETTINGS': {
+        const previous = settings;
         settings = { ...settings, ...message.settings };
-        if (isActive) {
-          updateTranslationStyles();
-        }
-        sendResponse({ success: true });
-        break;
+        (async () => {
+          if (isActive && (isDomainExcluded() || !settings.hasApiKey)) {
+            await stopTranslation();
+          } else if (isActive && (previous.targetLang !== settings.targetLang || previous.model !== settings.model)) {
+            await retranslatePage(false);
+          } else if (isActive) {
+            updateTranslationStyles();
+            pump();
+          }
+          sendResponse({ success: true, isActive, error: lastError });
+        })();
+        return true;
+      }
     }
   });
 
@@ -189,18 +194,24 @@
   // 翻译主逻辑：连续优先级调度
   // ============================================================
 
-  async function startTranslation() {
+  async function startTranslation(force = false) {
     if (isActive) return;
 
+    lastError = '';
     // 检查排除域名
-    if (isDomainExcluded()) return;
+    if (isDomainExcluded()) {
+      lastError = '此网站已在排除列表中';
+      return;
+    }
 
     if (!settings.hasApiKey) {
-      console.warn('[TRS] 未配置 API Key，请右键扩展图标 → 选项 进行配置');
+      lastError = '请先在设置中配置 DeepSeek API Key';
+      console.warn('[TRS]', lastError);
       return;
     }
 
     isActive = true;
+    bypassCache = force;
     runId++;
     inFlight = 0;
     registry.clear();
@@ -216,9 +227,16 @@
   }
 
   /**
-   * 重新翻译：清空译文与登记表后重跑，保证重新走 API（而非命中旧缓存）
+   * 重新翻译：清空译文与登记表后重跑，按钮强制刷新绕过缓存；语言/模型切换可复用对应缓存
    */
-  async function retranslatePage() {
+  async function retranslatePage(force = false) {
+    bypassCache = force;
+    lastError = '';
+    const wasActive = isActive;
+    isActive = false; // 等取消完成后再允许新内容进入调度器。
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = null;
+    pendingRefreshRoots.clear();
     runId++; // 在途结果作废
     const myRunId = runId;
     inFlight = 0;
@@ -228,16 +246,18 @@
     removeAllTranslations();
     await cancelTranslationRequests();
     if (myRunId !== runId) return;
-    if (isActive) {
+    if (wasActive) {
+      isActive = true;
       refresh(true);
     } else {
-      await startTranslation();
+      await startTranslation(force);
     }
   }
 
   async function stopTranslation() {
-    if (!isActive && queue.length === 0 && inFlight === 0) return;
+    lastError = '';
     isActive = false;
+    lastError = '';
     runId++; // 在途结果全部作废
     inFlight = 0;
     registry.clear();
@@ -269,9 +289,86 @@
   }
 
   function removeAllTranslations() {
-    const translations = document.querySelectorAll('.trs-translation');
+    const translations = [...document.querySelectorAll('.trs-translation')];
+    const anchor = findReadingAnchor(translations);
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const scroller = anchor && findScrollContainer(anchor);
+
     translations.forEach(el => el.remove());
     translatedElements = new WeakMap();
+
+    if (anchor?.isConnected && Number.isFinite(anchorTop)) {
+      stabilizeReadingAnchor(anchor, anchorTop, scroller);
+    }
+  }
+
+  /** 优先锁定视口内译文对应的原文块，否则取视口采样点下的稳定页面元素。 */
+  function findReadingAnchor(translations) {
+    const targetY = window.innerHeight * 0.35;
+    let best = null;
+    let bestDistance = Infinity;
+
+    for (const translation of translations) {
+      const rect = translation.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+      const candidate = translation.parentElement;
+      if (!candidate || window.getComputedStyle(candidate).position === 'fixed') continue;
+      const distance = Math.abs(rect.top - targetY);
+      if (distance < bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+      }
+    }
+    if (best) return best;
+
+    const xs = [0.5, 0.33, 0.67].map(ratio => window.innerWidth * ratio);
+    const ys = [0.35, 0.5, 0.65].map(ratio => window.innerHeight * ratio);
+    for (const y of ys) {
+      for (const x of xs) {
+        const elements = document.elementsFromPoint?.(x, y) || [document.elementFromPoint?.(x, y)];
+        for (const element of elements) {
+          if (!element || element === document.body || element === document.documentElement) continue;
+          if (element.closest?.('.trs-toast')) continue;
+          const candidate = element.closest?.('.trs-translation')?.parentElement || element;
+          if (candidate?.isConnected && window.getComputedStyle(candidate).position !== 'fixed') {
+            return candidate;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function findScrollContainer(element) {
+    for (let parent = element.parentElement; parent && parent !== document.body; parent = parent.parentElement) {
+      const overflowY = window.getComputedStyle(parent).overflowY;
+      if (/(auto|scroll|overlay)/.test(overflowY) && parent.scrollHeight > parent.clientHeight) {
+        return parent;
+      }
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function restoreReadingAnchor(anchor, anchorTop, scroller) {
+    const adjust = target => {
+      const delta = anchor.getBoundingClientRect().top - anchorTop;
+      if (Math.abs(delta) > 0.5) target.scrollTop += delta;
+    };
+    adjust(scroller);
+
+    const documentScroller = document.scrollingElement || document.documentElement;
+    if (scroller !== documentScroller) adjust(documentScroller);
+  }
+
+  /** SPA/虚拟列表可能延迟重排；短暂跨帧固定锚点，覆盖后续高度修正。 */
+  function stabilizeReadingAnchor(anchor, anchorTop, scroller) {
+    let frame = 0;
+    const pin = () => {
+      if (!anchor.isConnected) return;
+      restoreReadingAnchor(anchor, anchorTop, scroller);
+      if (++frame < 8) requestAnimationFrame(pin);
+    };
+    pin();
   }
 
   function updateTranslationStyles() {
@@ -282,6 +379,7 @@
       document.head.appendChild(styleEl);
     }
     styleEl.textContent = generateDynamicCSS();
+    document.querySelectorAll('.trs-translation').forEach(el => applyAdaptiveColor(el, el.parentElement));
   }
 
   /**
@@ -443,12 +541,20 @@
         texts,
         targetLang: settings.targetLang,
         model: settings.model,
+        bypassCache,
       });
 
       if (!isActive || requestRunId !== runId) return; // 等待期间可能已关闭或重启翻译
 
       if (response.error) {
         console.error('[TRS] 翻译错误:', response.error);
+        if (response.retryable === false) {
+          await stopTranslation();
+          lastError = response.error;
+          showToast(lastError, 'off');
+          return;
+        }
+        lastError = response.error;
         requeueFailed(entries);
         return;
       }
@@ -629,7 +735,7 @@
       if (textRatio < 0.3) continue;
 
       // 登记到 registry：相同文本共享一次 API 调用
-      const normalized = text.trim().toLowerCase();
+      const normalized = text.trim();
       let entry = registry.get(normalized);
       if (!entry) {
         entry = {
@@ -678,7 +784,7 @@
     return candidates;
   }
 
-  const styleCache = new WeakMap();
+  let styleCache = new WeakMap();
 
   /**
    * 判断元素是否实际不可见（display:none / visibility:hidden / 零尺寸）。
@@ -721,8 +827,8 @@
 
   // 缓存样式/结构判断结果（WeakMap 不阻止 GC）
   // X 等 SPA 滚动时会反复重扫 DOM，避免每次触发昂贵的 getComputedStyle
-  const inlineCache = new WeakMap();
-  const blockCache = new WeakMap();
+  let inlineCache = new WeakMap();
+  let blockCache = new WeakMap();
 
   function isInlineElement(el) {
     if (inlineCache.has(el)) return inlineCache.get(el);
@@ -858,39 +964,90 @@
     }
     const text = getDirectText(element);
     if (!text) return;
-    const entry = registry.get(text.trim().toLowerCase());
+    const entry = registry.get(text.trim());
     if (entry && entry.done && entry.translation) {
       injectTranslation(element, entry.translation, entry.text);
     }
   }
 
-  /**
-   * 解析 RGB 字符串为 [r, g, b] 数组
-   */
+  /** 解析计算后的 rgb/rgba 颜色为 [r, g, b, alpha]。 */
   function parseRGB(rgbStr) {
-    const match = rgbStr.match(/[\d.]+/g);
-    if (!match || match.length < 3) return [0, 0, 0];
-    return match.slice(0, 3).map(Number);
+    const match = String(rgbStr || '').match(/[\d.]+/g);
+    if (!match || match.length < 3) return [0, 0, 0, 0];
+    const values = match.map(Number);
+    const alpha = Math.min(Math.max(values[3] ?? 1, 0), 1);
+    return [values[0], values[1], values[2], alpha];
   }
 
   /**
-   * 根据原文字颜色自动生成柔和的译文颜色
-   * 思路：取原文字颜色与中灰混合，暗的变亮、亮的变暗，同时降低饱和度
+   * 合成元素到页面根节点的背景色；透明背景按浏览器默认白色画布处理。
    */
+  function getEffectiveBackground(element) {
+    const layers = [];
+    for (let el = element; el; el = el.parentElement) {
+      const layer = parseRGB(window.getComputedStyle(el).backgroundColor);
+      if (layer[3] > 0) {
+        layers.push(layer);
+        if (layer[3] === 1) break;
+      }
+    }
+
+    const background = [255, 255, 255];
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const [r, g, b, alpha] = layers[i];
+      background[0] = r * alpha + background[0] * (1 - alpha);
+      background[1] = g * alpha + background[1] * (1 - alpha);
+      background[2] = b * alpha + background[2] * (1 - alpha);
+    }
+    return background;
+  }
+
+  function relativeLuminance([r, g, b]) {
+    const linear = value => {
+      const channel = value / 255;
+      return channel <= 0.04045 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+  }
+
+  function contrastRatio(first, second) {
+    const lighter = Math.max(relativeLuminance(first), relativeLuminance(second));
+    const darker = Math.min(relativeLuminance(first), relativeLuminance(second));
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  /** 保留原文字色；仅在不足 4.5:1 时向黑或白做最小幅度修正。 */
+  function ensureReadableColor(original, background) {
+    if (contrastRatio(original, background) >= 4.5) return original.map(Math.round);
+
+    const black = [0, 0, 0];
+    const white = [255, 255, 255];
+    const target = contrastRatio(black, background) > contrastRatio(white, background) ? black : white;
+    let low = 0;
+    let high = 1;
+    for (let i = 0; i < 12; i++) {
+      const amount = (low + high) / 2;
+      const candidate = original.map((channel, index) => channel + (target[index] - channel) * amount);
+      if (contrastRatio(candidate, background) >= 4.5) high = amount;
+      else low = amount;
+    }
+    return original.map((channel, index) => {
+      const corrected = channel + (target[index] - channel) * high;
+      return target[index] === 0 ? Math.floor(corrected) : Math.ceil(corrected);
+    });
+  }
+
+  /** 译文尽量沿用原文字色，并以可辨识度为兜底。 */
   function applyAdaptiveColor(translationEl, parentEl) {
-    const originalColor = window.getComputedStyle(parentEl).color;
-    const [r, g, b] = parseRGB(originalColor);
+    const background = getEffectiveBackground(parentEl);
+    const [r, g, b, alpha] = parseRGB(window.getComputedStyle(parentEl).color);
+    const original = [r, g, b].map((channel, index) =>
+      channel * alpha + background[index] * (1 - alpha));
+    const [tr, tg, tb] = ensureReadableColor(original, background);
 
-    // 与中灰色混合（60% 原色 + 40% 灰色 = 自然柔化）
-    const mix = (c) => Math.round(c * 0.6 + 128 * 0.4);
-    const mr = mix(r), mg = mix(g), mb = mix(b);
-
-    const mutedColor = `rgb(${mr},${mg},${mb})`;
-    const mutedAlpha = `rgba(${mr},${mg},${mb},0.35)`;
-
-    translationEl.style.setProperty('--trs-color', mutedColor);
-    translationEl.style.setProperty('--trs-border-color', mutedColor);
-    translationEl.style.setProperty('--trs-border-alpha', mutedAlpha);
+    const color = `rgb(${tr},${tg},${tb})`;
+    translationEl.style.setProperty('--trs-color', color);
+    translationEl.style.setProperty('--trs-border-color', color);
   }
 
   /**
@@ -978,8 +1135,25 @@
         return null;
       };
 
+      let invalidated = false;
+      let appearanceChanged = false;
       for (const mutation of mutations) {
-        if (mutation.type === 'childList') {
+        const targetElement = mutation.target.nodeType === Node.TEXT_NODE
+          ? mutation.target.parentElement : mutation.target;
+        if (targetElement?.closest?.('.trs-translation, .trs-toast, [data-trs-ignore]')) continue;
+        const foreignChange = mutation.type !== 'childList' ||
+          [...mutation.addedNodes, ...mutation.removedNodes].some(node => !isTrsNode(node));
+        if (foreignChange && !invalidated) {
+          styleCache = new WeakMap();
+          inlineCache = new WeakMap();
+          blockCache = new WeakMap();
+          invalidated = true;
+        }
+        if (mutation.type === 'attributes') {
+          appearanceChanged = true;
+          hasNewContent = true;
+          changedRoots.add(unmarkTranslatedAncestor(mutation.target) || mutation.target);
+        } else if (mutation.type === 'childList') {
           // 页面替换/扩展了已翻译元素的内容（如 X 的 "Show more" 展开）：
           // 变更里包含非译文节点时，取消目标元素及其祖先的"已翻译"标记，
           // 让收集器按展开后的新文本重新翻译
@@ -993,6 +1167,7 @@
             }
           }
           if (hasForeignNodes) {
+            hasNewContent = true;
             changedRoots.add(unmarkTranslatedAncestor(mutation.target) || mutation.target);
           }
 
@@ -1029,16 +1204,22 @@
           // （排除扩展自身更新译文字本的 characterData 变更）
           const parentEl = mutation.target.parentElement;
           if (parentEl && !(parentEl.classList && parentEl.classList.contains('trs-translation'))) {
-            hasNewContent = Boolean(mutation.target.textContent.trim());
+            hasNewContent ||= Boolean(mutation.target.textContent.trim());
             changedRoots.add(unmarkTranslatedAncestor(parentEl) || parentEl);
           }
         }
       }
 
+      if (appearanceChanged) updateTranslationStyles();
       if (hasNewContent || translatedContentChanged) {
         // 不设长防抖：新内容立即进入优先级队列，调度器会按距离排序
         for (const root of changedRoots) refresh(false, root);
       }
+    });
+
+    // 主题 class 常挂在 html 上；仅监听其属性，不扫描 head 中的扩展样式。
+    observer.observe(document.documentElement, {
+      attributes: true, attributeFilter: ['class', 'style', 'hidden'],
     });
 
     // document.body 可能尚未就绪（如 XML 页面、某些 iframe 等边缘场景）
@@ -1046,6 +1227,8 @@
       observer.observe(document.body, {
         childList: true,
         characterData: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'hidden'],
         subtree: true,
       });
     } else {
@@ -1055,6 +1238,8 @@
           observer.observe(document.body, {
             childList: true,
             characterData: true,
+            attributes: true,
+            attributeFilter: ['class', 'style', 'hidden'],
             subtree: true,
           });
         }
@@ -1073,7 +1258,7 @@
   let scrollTimer = null;
 
   function setupScrollListener() {
-    window.addEventListener('scroll', () => {
+    document.addEventListener('scroll', () => {
       if (!isActive) return;
       // 队列充实时不打扰（新滚入的内容已在队列里，出队时会优先）
       if (queue.length + inFlight * BATCH_SIZE >= 60) return;
@@ -1082,7 +1267,7 @@
         scrollTimer = null;
         if (isActive) refresh(true);
       }, 120);
-    }, { passive: true });
+    }, { passive: true, capture: true });
   }
 
   /**

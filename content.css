@@ -1,6 +1,6 @@
 /* ============================================================
    TRS Content Styles - 注入网页的译文样式
-   颜色由 JS 根据原文字颜色自适应（--trs-color）
+   颜色由 JS 参照原文字色并根据页面背景保证对比度（--trs-color）
    所有属性加 !important 防止站点样式干扰
    ============================================================ */
 
@@ -29,7 +29,7 @@
   font-weight: normal !important;
   font-style: normal !important;
   line-height: inherit !important;
-  opacity: 0.85;
+  opacity: 1;
   transition: opacity 0.2s ease;
   user-select: text;
   -webkit-user-select: text;

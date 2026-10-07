@@ -24,6 +24,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   let isPageActive = false;
   let isPageTranslating = false;
   let settings = {};
+  let pageError = '';
+  let isSupported = true;
 
   // ============================================================
   // 初始化
@@ -41,6 +43,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 检查 API Key
     checkApiKey();
+    if (isPageTranslating) {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) pollTranslationStatus(tab.id);
+    }
   }
 
   function applySettings() {
@@ -58,7 +64,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (status) {
         isPageActive = status.isActive;
         isPageTranslating = status.isTranslating;
+        pageError = status.error || '';
+        isSupported = true;
         updateUI();
+      } else {
+        showUnsupportedPage();
       }
     } catch (e) {
       isPageActive = false;
@@ -77,11 +87,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function showUnsupportedPage() {
+    isSupported = false;
+    isPageActive = false;
+    isPageTranslating = false;
+    btnRemove.disabled = true;
+    btnRetranslate.disabled = true;
     btnTranslate.disabled = true;
     btnTranslate.style.opacity = '0.5';
     btnTranslate.style.cursor = 'not-allowed';
     btnTranslateText.textContent = '此页面不支持翻译';
-    statusText.textContent = '不支持（系统页面）';
+    statusText.textContent = '无法连接此页面，请刷新网页或检查页面是否受限';
     statusDot.className = 'status-dot error';
   }
 
@@ -90,6 +105,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ============================================================
 
   function updateUI() {
+    if (!isSupported) { showUnsupportedPage(); return; }
+    btnRemove.disabled = false;
+    btnRetranslate.disabled = false;
     if (isPageActive) {
       if (isPageTranslating) {
         setStatus('translating', '翻译中...');
@@ -105,6 +123,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       btnTranslateText.textContent = '翻译本页';
       btnTranslate.classList.remove('running');
     }
+    if (pageError) setStatus('error', pageError);
     btnTranslate.disabled = false;
     btnTranslate.style.opacity = '1';
     btnTranslate.style.cursor = 'pointer';
@@ -149,27 +168,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) return;
 
-    if (isPageActive) {
-      await sendToTab(tab.id, { type: 'STOP_TRANSLATION' });
-      isPageActive = false;
-      isPageTranslating = false;
-    } else {
-      await sendToTab(tab.id, {
-        type: 'UPDATE_SETTINGS',
-        settings: {
-          targetLang: targetLang.value,
-        },
-      });
-      await sendToTab(tab.id, { type: 'START_TRANSLATION' });
-      isPageActive = true;
-      isPageTranslating = true;
-      setStatus('translating', '翻译中...');
-      btnTranslateText.textContent = '翻译中...';
-      btnTranslate.classList.add('running');
-      pollTranslationStatus(tab.id);
-    }
-
-    updateUI();
+    const response = await sendToTab(tab.id, {
+      type: isPageActive ? 'STOP_TRANSLATION' : 'START_TRANSLATION',
+    });
+    await finishAction(tab.id, response);
   });
 
   // 清除译文
@@ -177,10 +179,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) return;
 
-    await sendToTab(tab.id, { type: 'REMOVE_ALL_TRANSLATIONS' });
-    isPageActive = false;
-    isPageTranslating = false;
-    updateUI();
+    const response = await sendToTab(tab.id, { type: 'REMOVE_ALL_TRANSLATIONS' });
+    await finishAction(tab.id, response);
   });
 
   // 重新翻译
@@ -193,18 +193,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    await sendToTab(tab.id, {
-      type: 'UPDATE_SETTINGS',
-      settings: {
-        targetLang: targetLang.value,
-      },
-    });
-    await sendToTab(tab.id, { type: 'RETRANSLATE_PAGE' });
-    isPageActive = true;
-    isPageTranslating = true;
-    setStatus('translating', '重新翻译中...');
-    updateUI();
-    pollTranslationStatus(tab.id);
+    const response = await sendToTab(tab.id, { type: 'RETRANSLATE_PAGE' });
+    await finishAction(tab.id, response);
   });
 
   // 语言切换
@@ -212,20 +202,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     await chrome.storage.sync.set({ targetLang: targetLang.value });
     settings.targetLang = targetLang.value;
 
-    if (isPageActive) {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(tabs.filter(tab => tab.id).map(tab => sendToTab(tab.id, {
+      type: 'UPDATE_SETTINGS', settings: { targetLang: targetLang.value },
+    })));
+    await refreshStatus();
+    if (isPageTranslating) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) {
-        await sendToTab(tab.id, {
-          type: 'UPDATE_SETTINGS',
-          settings: { targetLang: targetLang.value },
-        });
-        await sendToTab(tab.id, { type: 'RETRANSLATE_PAGE' });
-        isPageTranslating = true;
-        setStatus('translating', '切换语言，重新翻译...');
-        pollTranslationStatus(tab.id);
-      }
+      if (tab?.id) pollTranslationStatus(tab.id);
     }
   });
+
+  async function finishAction(tabId, response) {
+    if (!response) { showUnsupportedPage(); return; }
+    await refreshStatus();
+    if (response.error) { pageError = response.error; updateUI(); }
+    if (isPageTranslating) pollTranslationStatus(tabId);
+  }
 
   // 导航到设置页
   goToOptions.addEventListener('click', (e) => {
@@ -258,6 +251,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (status) {
           isPageActive = status.isActive;
           isPageTranslating = status.isTranslating;
+          pageError = status.error || '';
+          updateUI();
 
           if (!isPageTranslating || attempts >= maxAttempts) {
             clearInterval(pollTimer);
@@ -273,6 +268,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // 连接断开（弹窗关闭、页面切换等），静默停止
         clearInterval(pollTimer);
         pollTimer = null;
+        showUnsupportedPage();
       }
     }, 1000);
   }
@@ -289,5 +285,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 启动
   // ============================================================
 
-  init();
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.apiKey) {
+      settings.hasApiKey = Boolean(changes.apiKey.newValue);
+      checkApiKey();
+      return;
+    }
+    if (area !== 'sync') return;
+    for (const [key, change] of Object.entries(changes)) settings[key] = change.newValue;
+    applySettings();
+  });
+
+  init().catch(() => setStatus('error', '无法读取扩展设置，请重新打开弹窗'));
 });
